@@ -214,12 +214,12 @@ def calculate_hub_targets_from_selected_routes(selected_routes, target_demand_df
     # r loopu t den sonra olacak 
     # 
     # TODO 
+    for t in sorted(target_demand_df['t'].unique()):
+        selected_routes_for_t=selected_routes[selected_routes['t']==t]
+        for r in selected_routes_for_t['r'].unique():#seçilen her bir rota için döngü başlat
+            depots = route_to_depots.get(r, []) #bu rota hangi depoları kapsıyor
+            b = route_to_hub[r] #rota hangi hubtan başlıyor
 
-    for r in selected_routes:#seçilen her bir rota için döngü başlat
-        depots = route_to_depots.get(r, []) #bu rota hangi depoları kapsıyor
-        b = route_to_hub[r] #rota hangi hubtan başlıyor
-
-        for t in target_demand_df["t"].unique(): #tüm zaman periyotları için döngü başlat
         #aşağıdaki isin methodu Depo d kolonundaki değerlerin depots listesinde olup olmadığını kontrol eder.Örneğin: depots = [25, 24, 14, 13] ise, d kolonu içinde bu 4 depoyu filtreler.
             total = target_demand_df[
                 (target_demand_df["d"].isin(depots)) & (target_demand_df["t"] == t)
@@ -227,10 +227,10 @@ def calculate_hub_targets_from_selected_routes(selected_routes, target_demand_df
             hub_targets[(b, t)] += total #oplam talebi hub b için, zaman t’de gönderilmesi gereken miktar olarak hub_targets’a ekler. Böylece aynı (b,t) için farklı rotalarla gelen değerler toplanır.
 
     # İsteğe bağlı: DataFrame formatında da dönebiliriz
-    hub_targets_df = pd.DataFrame([
-        {"b": b, "t": t, "target_amount": amt}
-        for (b, t), amt in hub_targets.items()
-    ])
+        hub_targets_df = pd.DataFrame([
+            {"b": b, "t": t, "target_amount": amt}
+            for (b, t), amt in hub_targets.items()
+        ])
     return hub_targets_df
 
 def assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, prob_dict, vehicle_owners_df,
@@ -267,7 +267,12 @@ def assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, prob_dict, 
                 
                 best_cost = float("inf")
                 best_choice = None
-                
+                ##TO DO
+                # Burda vehicle hub eşleştirmesi yaparken total durumdaki tüm eşleştirmelerin total costuna değil 
+                # kalan araçlar ve o aracı özelinde arasından en düşük costa bakıyor. Huba araç-üretici 
+                # kombinasyonları atamak daha mantıklı gibi
+                ##TO DO
+
                 for k in candidate_vehicles:# Her bir aday araç ve hub kombinasyonunu dene
                     for b in B_set: 
                         if vehicle_cap[k] <= 0:
