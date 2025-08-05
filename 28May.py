@@ -78,7 +78,7 @@ R_set = sorted(route_to_depots.keys())  # Tüm rota ID’leri
 
 
 # Parametreler
-iterations = 1  # Toplam iterasyon sayısı
+iterations = 3  # Toplam iterasyon sayısı
 z_value = 2.575    # Güven aralığı katsayısı (örn. %99)
 variation_rate = 0.10  # Standart sapma oranı
 waste_cost = 27.55696873 #atık maliyeti
@@ -107,6 +107,7 @@ def calculate_comprehensive_costs(selected_routes, suppliers_assignments, waste_
             'iteration': iteration,
             'route_costs': 0,
             'assignment_costs': 0,
+            'transportation_costs': 0,
             'inventory_costs': 0,
             'waste_costs': 0,
             'total_cost': 0
@@ -321,6 +322,7 @@ def calculate_hub_targets_from_selected_routes(selected_routes, target_demand_df
                 ]["target"].sum()
                 hub_targets[(b, t)] += total #oplam talebi hub b için, zaman t'de gönderilmesi gereken miktar olarak hub_targets'a ekler. Böylece aynı (b,t) için farklı rotalarla gelen değerler toplanır.
 
+
         # İsteğe bağlı: DataFrame formatında da dönebiliriz - append to existing dataframe
         iter_hub_targets_df = pd.DataFrame([
             {"iteration":iter,"b": b, "t": t, "target_amount": amt}
@@ -346,10 +348,15 @@ def get_target_amount(remaining_targets, b, t, default_value=0):
     Returns:
     - target_amount: float, the target amount if found, 0 if not found or empty
     """
+    """""
     targets_row = remaining_targets[(remaining_targets['b'] == b) & (remaining_targets['t'] == t)]
     if targets_row.empty:
         return default_value
     return targets_row.iloc[0, remaining_targets.columns.get_loc('target_amount')]
+    """
+
+    filtered = remaining_targets[(remaining_targets['b'] == b) & (remaining_targets['t'] == t)]
+    return filtered["target_amount"].sum() if not filtered.empty else default_value
 
 def assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, prob_dict, vehicle_owners_df,
                      hub_targets, F_set, K_set, B_set, S_set, T_set):
@@ -360,76 +367,96 @@ def assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, prob_dict, 
 
     assignments = []  # Tüm atamaları tutacak liste
 
+  
+    """
+    # ADIM 1: Toplam arzı yazdır (s=1, t=1)
+    total_supply_s1t1 = sum(
+        v for (f_, s_, t_), v in supply_dict.items() if s_ == 1 and t_ == 1
+    )
+    print(f"[KONTROL] Senaryo 1, Zaman 1 için toplam tedarikçi arzı: {total_supply_s1t1}")
+    """
+
     for iter in hub_targets['iteration'].unique():
         hub_targets_for_iter = hub_targets[hub_targets['iteration'] == iter]
+        print(f"[İZLEME] {iter} için atama işlemi başlatıldı.")
 
         for s in S_set:  # Senaryo döngüsü
             for t in T_set:
-
+                for b in B_set:
+               
                 # Bu senaryo için hedefleri yeniden başlat (senaryosuz hedef)
-                remaining_targets = hub_targets_for_iter[hub_targets_for_iter["t"] == t].copy()
-                vehicle_cap = {k: theta_dict.get(k, 0) for k in K_set}
+                    remaining_targets = hub_targets_for_iter[(hub_targets_for_iter["t"] == t) & (hub_targets_for_iter["b"] == b)].copy()
+                
+                    vehicle_cap = {k: theta_dict.get(k, 0) for k in K_set}
 
-                for f in F_set:
-                    supply = supply_dict.get((f, s, t), 0)
-                    if supply <= 0:
-                        continue
-                    
-                    # Eğer tedarikçinin kendi aracı varsa sadece onu kullanır
-                    owned_vehicles = vehicle_owners_df[vehicle_owners_df["f"] == f]["k"].tolist()
-                    candidate_vehicles = owned_vehicles if owned_vehicles else K_set
+                    for f in F_set:
+                        supply = supply_dict.get((f, s, t), 0)
+                        if supply <= 0:
+                            continue
+                        
+                        # Eğer tedarikçinin kendi aracı varsa sadece onu kullanır
+                        owned_vehicles = vehicle_owners_df[vehicle_owners_df["f"] == f]["k"].tolist()
+                        candidate_vehicles = owned_vehicles if owned_vehicles else K_set
 
-                    retry = True  # En az bir atama yapılana kadar dön
-                    while supply > 0:
-                        retry = False  # Eğer bu turda atama yapılmazsa çıkılacak
+                        retry = True  # En az bir atama yapılana kadar dön
+                        while supply > 0:
+                            retry = False  # Eğer bu turda atama yapılmazsa çıkılacak
 
-                        best_cost = float("inf")
-                        best_choice = None
+                            best_cost = float("inf")
+                            best_choice = None
 
-                        for k in candidate_vehicles:
-                            if vehicle_cap[k] <= 0:
-                                continue
-
-                            for _, row in remaining_targets.iterrows():
-                                b = row['b']
-                                remaining = row['target_amount']
-                                if remaining <= 0:
+                            for k in candidate_vehicles:
+                                if vehicle_cap[k] <= 0:
                                     continue
 
-                                gamma_cost = gamma_dict.get((f, b, k), 1e6)
-                                beta_cost = beta_dict.get((f, k), 1e6)
-                                total_cost = prob_dict[s] * (beta_cost + gamma_cost)
+                                for _, row in remaining_targets.iterrows():
+                                    b = row['b']
+                                    remaining = row['target_amount']
+                                    if remaining <= 0:
+                                        continue
 
-                                if total_cost < best_cost:
-                                    best_cost = total_cost
-                                    best_choice = (k, b)
+                                    gamma_cost = gamma_dict.get((f, b, k), 1e6)
+                                    beta_cost = beta_dict.get((f, k), 1e6)
+                                    total_cost = prob_dict[s] * (beta_cost + gamma_cost)
+                                   
+                                    if total_cost < best_cost:
+                                        best_cost = total_cost
+                                        best_choice = (k, b)
 
-                        # Eğer uygun eşleşme bulunduysa
-                        if best_choice:
-                            k, b = best_choice
-                            target_amt = remaining_targets.loc[remaining_targets['b'] == b, 'target_amount'].values[0]
-                            assign_qty = min(supply, vehicle_cap[k], target_amt)
+                            # Eğer uygun eşleşme bulunduysa
+                            if best_choice:
+                                k, b = best_choice
+                                target_amt = remaining_targets[
+                                    (remaining_targets['b'] == b) & (remaining_targets['t'] == t)
+                                    ]['target_amount'].values[0]
 
+                                #target_amt = remaining_targets.loc[remaining_targets['b'] == b, 'target_amount'].values[0]
+                                assign_qty = min(supply, vehicle_cap[k], target_amt)
+
+                                vehicle_cap[k] -= assign_qty
+                                supply -= assign_qty
+                                # Hedeften düş
+                                remaining_targets.loc[
+                                    (remaining_targets['b'] == b) & (remaining_targets['t'] == t),
+                                    'target_amount'
+                                    ] -= assign_qty
+
+                                #remaining_targets.loc[remaining_targets['b'] == b, 'target_amount'] -= assign_qty
+                            else:
+                                break # Uygun eşleşme kalmadıysa çık
+                                
                             assignments.append({
-                                "iteration": iter,
-                                "s": s,
-                                "t": t,
-                                "f": f,
-                                "k": k,
-                                "b": b,
-                                "amount": assign_qty
-                            })
+                                    "iteration": iter,
+                                    "s": s,
+                                    "t": t,
+                                    "f": f,
+                                    "k": k,
+                                    "b": b,
+                                    "amount": assign_qty
+                                })
 
-                            vehicle_cap[k] -= assign_qty
-                            supply -= assign_qty
-                            # Hedeften düş
-                            remaining_targets.loc[remaining_targets['b'] == b, 'target_amount'] -= assign_qty
-                        else:
-                            break # Uygun eşleşme kalmadıysa çık
 
     return pd.DataFrame(assignments)
-
-
 
 
 
@@ -519,45 +546,9 @@ def fifo_inventory_and_waste(selected_routes, demand_dict, time_periods, shelf_l
 
     return waste_df, remaining_inventory_df
 
-
-target_demand = generate_target_demand(demand_df, z_value, variation_rate, multi_period=False)
-
-# CSV'ye kaydet (opsiyonel)
-target_demand.to_csv("target_demand_all_iterations.csv", index=False)
-
-selected_routes = select_routes_based_on_target(target_demand, route_to_depots)
-
-# Save selected_routes to CSV
-selected_routes.to_csv("selected_routes_all_iterations.csv", index=False)
-
-hub_targets_df = calculate_hub_targets_from_selected_routes(selected_routes, target_demand, route_to_depots, route_to_hub)
-
-# Save hub_targets_df to CSV
-hub_targets_df.to_csv("hub_targets_all_iterations.csv", index=False)
-
-suppliers_assignments = assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, scenario_probs, vehicle_owners_df,
-                     hub_targets_df, F_set, K_set, B_set, S_set, T_set)
-
-# Save suppliers_assignments to CSV
-suppliers_assignments.to_csv("suppliers_assignments_all_iterations.csv", index=False)
-
-waste_df, remaining_inventory_df = fifo_inventory_and_waste(selected_routes, demand_dict, T_set, shelf_life=2)
-
-# Save the results to CSV files
-waste_df.to_csv("waste_df_all_iterations.csv", index=True)
-remaining_inventory_df.to_csv("remaining_inventory_df_all_iterations.csv",index=True)
-
-comprehensive_costs_df = calculate_comprehensive_costs(selected_routes, suppliers_assignments, waste_df, remaining_inventory_df, 
-                                route_costs_dict, stock_cost_dict, waste_cost, scenario_probs)
-
-
-# Save comprehensive_costs_df to CSV
-comprehensive_costs_df.to_csv("comprehensive_costs_all_iterations.csv", index=False)
-
-
-def print_cost_summary(comprehensive_costs_df, selected_routes):
+def print_cost_summary(comprehensive_costs_df):
     """
-    Kapsamlı maliyet analizi ve rota kullanım özetini yazdırır.
+    Kapsamlı maliyet analizi, en iyi iterasyonu bulma ve özetleri yazdırır.
     """
     print("=" * 80)
     print("KAPSAMLI MALİYET ANALİZİ - TÜM İTERASYONLAR")
@@ -573,7 +564,216 @@ def print_cost_summary(comprehensive_costs_df, selected_routes):
         'total_cost': 'sum'
     })
 
+    # 🔍 En düşük maliyetli iterasyonu bul
+    best_iter = total_costs['total_cost'].idxmin()
+    best_row = total_costs.loc[best_iter]
 
+    print(f"\n🏆 En Düşük Maliyetli İterasyon: {best_iter.upper()}")
+    print(f"   • TOPLAM MALİYET: {best_row['total_cost']:,.2f} TL")
+    print("   • Maliyet Dağılımı:")
+    print(f"     - Rota:     {best_row['route_costs']:,.2f} TL")
+    print(f"     - Atama:    {best_row['assignment_costs']:,.2f} TL")
+    print(f"     - Taşıma:   {best_row['transportation_costs']:,.2f} TL")
+    print(f"     - Envanter: {best_row['inventory_costs']:,.2f} TL")
+    print(f"     - Atık:     {best_row['waste_costs']:,.2f} TL")
+    
+    # Sadece best iter için yüzdesel dağılım
+    total = best_row['total_cost']
+    if total > 0:
+        print(f"\n📈 Maliyet Dağılımı (%):")
+        print(f"     - Rota:     {(best_row['route_costs']/total)*100:>6.1f}%")
+        print(f"     - Atama:    {(best_row['assignment_costs']/total)*100:>6.1f}%")
+        print(f"     - Taşıma:   {(best_row['transportation_costs']/total)*100:>6.1f}%")
+        print(f"     - Envanter: {(best_row['inventory_costs']/total)*100:>6.1f}%")
+        print(f"     - Atık:     {(best_row['waste_costs']/total)*100:>6.1f}%")
+    """
+    # Tüm iterasyonlar için detaylı maliyet dağılımı
+    print("\n📊 İTERASYON BAZLI MALİYET DAĞILIMI:")
+    for iteration in total_costs.index:
+        costs = total_costs.loc[iteration]
+        print(f"\n🔍 {iteration.upper()}:")
+        print(f"   • Rota Maliyetleri:         {costs['route_costs']:>12,.2f} TL")
+        print(f"   • Tedarikçi Atama Maliyetleri: {costs['assignment_costs']:>8,.2f} TL")
+        print(f"   • Taşıma Maliyetleri:       {costs['transportation_costs']:>8,.2f} TL")
+        print(f"   • Envanter Maliyetleri:     {costs['inventory_costs']:>12,.2f} TL")
+        print(f"   • Atık Maliyetleri:         {costs['waste_costs']:>12,.2f} TL")
+        print(f"   • TOPLAM MALİYET:           {costs['total_cost']:>12,.2f} TL")
+
+        # Yüzdesel dağılım
+        total = costs['total_cost']
+        if total > 0:
+            print(f"   📈 Maliyet Dağılımı (%):")
+            print(f"     - Rota:         {(costs['route_costs']/total)*100:>6.1f}%")
+            print(f"     - Atama:        {(costs['assignment_costs']/total)*100:>6.1f}%")
+            print(f"     - Taşıma:       {(costs['transportation_costs']/total)*100:>6.1f}%")
+            print(f"     - Envanter:     {(costs['inventory_costs']/total)*100:>6.1f}%")
+            print(f"     - Atık:         {(costs['waste_costs']/total)*100:>6.1f}%")
+
+    print("\n📈 GENEL İSTATİSTİKLER:")
+    print(f"   • Ortalama Toplam Maliyet:     {comprehensive_costs_df['total_cost'].mean():>12,.2f} TL")
+    print(f"   • Minimum Toplam Maliyet:      {comprehensive_costs_df['total_cost'].min():>12,.2f} TL")
+    print(f"   • Maksimum Toplam Maliyet:     {comprehensive_costs_df['total_cost'].max():>12,.2f} TL")
+    print(f"   • Standart Sapma:              {comprehensive_costs_df['total_cost'].std():>12,.2f} TL")
+    """
+    print("\n" + "=" * 80)
+    print("ANALİZ TAMAMLANDI - En iyi iterasyon sonuçları kaydedildi.")
+    print("=" * 80)
+
+    return best_iter
+
+# 1. Hedef talep oluştur
+target_demand = generate_target_demand(demand_df, z_value, variation_rate, multi_period=False)
+
+# 2. Rota seçimi
+selected_routes = select_routes_based_on_target(target_demand, route_to_depots)
+
+# 3. Hub hedefleri hesapla
+hub_targets_df = calculate_hub_targets_from_selected_routes(
+    selected_routes, target_demand, route_to_depots, route_to_hub)
+# Save hub_targets_df to CSV
+hub_targets_df.to_csv("hub_targets_all_iterations.csv", index=False)
+
+# 4. Tedarikçi atamaları
+suppliers_assignments = assign_suppliers(
+    supply_dict, beta_dict, gamma_dict, theta_dict, scenario_probs,
+    vehicle_owners_df, hub_targets_df, F_set, K_set, B_set, S_set, T_set)
+
+# 5. FIFO bazlı atık ve stok takibi
+waste_df, remaining_inventory_df = fifo_inventory_and_waste(
+    selected_routes, demand_dict, T_set, shelf_life=2)
+
+# 6. Maliyet hesaplamaları
+comprehensive_costs_df = calculate_comprehensive_costs(
+    selected_routes, suppliers_assignments, waste_df, remaining_inventory_df,
+    route_costs_dict, stock_cost_dict, waste_cost, scenario_probs)
+
+# 7. En iyi iterasyonu bul
+best_iteration_row = comprehensive_costs_df.loc[comprehensive_costs_df['total_cost'].idxmin()]
+best_iteration = best_iteration_row['iteration']
+print(f"\n✅ En düşük maliyetli iterasyon: {best_iteration}")
+print(f"💰 Toplam maliyet: {best_iteration_row['total_cost']:,.2f} TL")
+
+# 8. Sadece en iyi iterasyonun sonuçlarını CSV olarak kaydet
+target_demand[target_demand['iteration'] == best_iteration].to_csv("best_target_demand.csv", index=False)
+selected_routes[selected_routes['iteration'] == best_iteration].to_csv("best_selected_routes.csv", index=False)
+suppliers_assignments[suppliers_assignments['iteration'] == best_iteration].to_csv("best_suppliers_assignments.csv", index=False)
+waste_df[waste_df['iteration'] == best_iteration].to_csv("best_waste_df.csv", index=False)
+remaining_inventory_df[remaining_inventory_df['iteration'] == best_iteration].to_csv("best_remaining_inventory_df.csv", index=False)
+
+# 9. Sadece tüm iterasyonların maliyet analizini kaydet
+comprehensive_costs_df.to_csv("comprehensive_costs_all_iterations.csv", index=False)
+
+# 10. Raporlama
+best_iter = print_cost_summary(comprehensive_costs_df)
+
+# --- [EK KONTROL] Best Iterasyon için Hub Giriş/Çıkış Miktarları Karşılaştırması ---
+
+# 1. Hub'a gelen toplam miktar (best_iteration için)
+incoming = hub_targets_df[hub_targets_df['iteration'] == best_iteration] \
+    .groupby(['b', 't'])['target_amount'].sum().reset_index(name='incoming_to_hub')
+
+# 2. Hub'dan çıkan toplam miktar (selected_routes üzerinden)
+selected_routes_best = selected_routes[selected_routes['iteration'] == best_iteration].copy()
+selected_routes_best['b'] = selected_routes_best['r'].map(route_to_hub)
+
+outgoing = selected_routes_best.groupby(['b', 't'])['amount'].sum().reset_index(name='outgoing_from_hub')
+
+# 3. Karşılaştırma
+comparison = pd.merge(incoming, outgoing, on=['b', 't'], how='outer')
+comparison['difference'] = comparison['incoming_to_hub'] - comparison['outgoing_from_hub']
+
+# 5. CSV olarak dışa aktar
+comparison.to_csv(f"hub_flow_comparison_{best_iteration}.csv", index=False)
+
+
+
+
+"""
+target_demand = generate_target_demand(demand_df, z_value, variation_rate, multi_period=False)
+
+# CSV'ye kaydet (opsiyonel)
+target_demand.to_csv("target_demand_all_iterations.csv", index=False)
+
+selected_routes = select_routes_based_on_target(target_demand, route_to_depots)
+
+# Save selected_routes to CSV
+selected_routes.to_csv("selected_routes_all_iterations.csv", index=False)
+
+hub_targets_df = calculate_hub_targets_from_selected_routes(selected_routes, target_demand, route_to_depots, route_to_hub)
+
+# Save hub_targets_df to CSV
+hub_targets_df.to_csv("hub_targets_all_iterations.csv", index=False)
+
+
+suppliers_assignments = assign_suppliers(supply_dict, beta_dict, gamma_dict, theta_dict, scenario_probs, vehicle_owners_df,
+                     hub_targets_df, F_set, K_set, B_set, S_set, T_set)
+
+# Save suppliers_assignments to CSV
+suppliers_assignments.to_csv("suppliers_assignments_all_iterations.csv", index=False)
+print("Kaç iterasyonluk veri geldi:", suppliers_assignments['iteration'].nunique())
+
+
+
+waste_df, remaining_inventory_df = fifo_inventory_and_waste(selected_routes, demand_dict, T_set, shelf_life=2)
+
+# Save the results to CSV files
+waste_df.to_csv("waste_df_all_iterations.csv", index=True)
+remaining_inventory_df.to_csv("remaining_inventory_df_all_iterations.csv",index=True)
+
+comprehensive_costs_df = calculate_comprehensive_costs(selected_routes, suppliers_assignments, waste_df, remaining_inventory_df, 
+                                route_costs_dict, stock_cost_dict, waste_cost, scenario_probs)
+
+
+# Save comprehensive_costs_df to CSV
+comprehensive_costs_df.to_csv("comprehensive_costs_all_iterations.csv", index=False)
+
+best_iteration_row = comprehensive_costs_df.loc[comprehensive_costs_df['total_cost'].idxmin()]
+best_iteration = best_iteration_row['iteration']
+print(f"En düşük maliyetli iterasyon: {best_iteration}")
+print(f"Toplam maliyet: {best_iteration_row['total_cost']}")
+
+best_routes = selected_routes[selected_routes['iteration'] == best_iteration]
+best_assignments = suppliers_assignments[suppliers_assignments['iteration'] == best_iteration]
+best_inventory = remaining_inventory_df[remaining_inventory_df['iteration'] == best_iteration]
+best_waste = waste_df[waste_df['iteration'] == best_iteration]
+
+
+best_routes.to_csv(f"best_routes_{best_iteration}.csv", index=False)
+best_assignments.to_csv(f"best_assignments_{best_iteration}.csv", index=False)
+best_inventory.to_csv(f"best_inventory_{best_iteration}.csv")
+best_waste.to_csv(f"best_waste_{best_iteration}.csv")
+
+
+def print_cost_summary(comprehensive_costs_df, selected_routes):
+ 
+    print("=" * 80)
+    print("KAPSAMLI MALİYET ANALİZİ - TÜM İTERASYONLAR")
+    print("=" * 80)
+
+    # Toplam maliyet özeti
+    total_costs = comprehensive_costs_df.groupby('iteration').agg({
+        'route_costs': 'sum',
+        'assignment_costs': 'sum',
+        'transportation_costs': 'sum',
+        'inventory_costs': 'sum',
+        'waste_costs': 'sum',
+        'total_cost': 'sum'
+    })
+
+    # 🔍 En düşük maliyetli iterasyonu bul
+    best_iter = total_costs['total_cost'].idxmin()
+    best_row = total_costs.loc[best_iter]
+
+    print(f"\n🏆 En Düşük Maliyetli İterasyon: {best_iter.upper()}")
+    print(f"   • TOPLAM MALİYET: {best_row['total_cost']:,.2f} TL")
+    print("   • Maliyet Dağılımı:")
+    print(f"     - Rota:     {best_row['route_costs']:,.2f} TL")
+    print(f"     - Atama:    {best_row['assignment_costs']:,.2f} TL")
+    print(f"     - Taşıma:   {best_row['transportation_costs']:,.2f} TL")
+    print(f"     - Envanter: {best_row['inventory_costs']:,.2f} TL")
+    print(f"     - Atık:     {best_row['waste_costs']:,.2f} TL")
+
+    # İterasyon bazlı detaylar
     print("\n📊 İTERASYON BAZLI MALİYET DAĞILIMI:")
     for iteration in total_costs.index:
         costs = total_costs.loc[iteration]
@@ -584,7 +784,6 @@ def print_cost_summary(comprehensive_costs_df, selected_routes):
         print(f"   • Envanter Maliyetleri:    {costs['inventory_costs']:>12,.2f} TL")
         print(f"   • Atık Maliyetleri:        {costs['waste_costs']:>12,.2f} TL")
         print(f"   • TOPLAM MALİYET:          {costs['total_cost']:>12,.2f} TL")
-      
 
         # Maliyet dağılımı yüzdesi
         total = costs['total_cost']
@@ -596,29 +795,16 @@ def print_cost_summary(comprehensive_costs_df, selected_routes):
             print(f"     - Envanter:     {(costs['inventory_costs']/total)*100:>6.1f}%")
             print(f"     - Atık:         {(costs['waste_costs']/total)*100:>6.1f}%")
 
-
-
     # Genel istatistikler
     print("\n📈 GENEL İSTATİSTİKLER:")
     print(f"   • Ortalama Toplam Maliyet:     {comprehensive_costs_df['total_cost'].mean():>12,.2f} TL")
     print(f"   • Minimum Toplam Maliyet:      {comprehensive_costs_df['total_cost'].min():>12,.2f} TL")
     print(f"   • Maksimum Toplam Maliyet:     {comprehensive_costs_df['total_cost'].max():>12,.2f} TL")
     print(f"   • Standart Sapma:              {comprehensive_costs_df['total_cost'].std():>12,.2f} TL")
-    
+
     print("\n" + "=" * 80)
     print("ANALİZ TAMAMLANDI - Detaylar CSV dosyalarında kaydedildi")
     print("=" * 80)
 
-
-# Ana çalıştırma akışı ve sonuç özeti
-print("\n🔄 Kapsamlı maliyet analizi hesaplanıyor...")
-print_cost_summary(comprehensive_costs_df, selected_routes)
-
-print("\n📁 KAYDEDILEN DOSYALAR:")
-print("   • target_demand_all_iterations.csv")
-print("   • selected_routes_all_iterations.csv") 
-print("   • hub_targets_all_iterations.csv")
-print("   • suppliers_assignments_all_iterations.csv")
-print("   • waste_df_all_iterations.csv")
-print("   • remaining_inventory_df_all_iterations.csv")
-print("   • comprehensive_costs_all_iterations.csv")
+    return best_iter  # en düşük maliyetli iterasyonu dışarı aktar
+"""
