@@ -114,10 +114,16 @@ def calculate_comprehensive_costs(selected_routes, suppliers_assignments, waste_
         }
 
         # 1. Rota maliyetleri hesaplama
+    
+        # 1. Rota maliyetleri hesaplama - her (r, t) kombinasyonu için sadece bir kez maliyet eklenir
         selected_routes_iter = selected_routes[selected_routes['iteration'] == iteration]
+        unique_r_t = selected_routes_iter[['r', 't']].drop_duplicates()
         route_costs = 0
-        for r in selected_routes_iter['r'].unique():
-            route_costs += route_costs_dict.get(r, 0)
+        for _, row in unique_r_t.iterrows():
+            r = row['r']
+            lambda_r = route_costs_dict.get(r, 0)
+            route_costs += lambda_r
+
         iteration_costs['route_costs'] = route_costs
 
         # 2. Tedarikçi atama maliyetleri (beta + gamma) - senaryo olasılıkları ile ağırlıklandırılmış
