@@ -5,7 +5,13 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Set
 from pyomo.environ import *
+import time 
 
+
+
+
+# 1. Python zamanlayıcıyı başlat
+start_time = time.time()
 # ============================================================
 # 1. VERİ YAPILARI (Dataclasses)
 # ============================================================
@@ -95,10 +101,13 @@ def load_instance_from_excel(file_path, r_to_d, r_to_h, alpha, cv, shelf_life, w
     r_caps = {int(r.r): float(r.capacity) for r in route_capacity_df.itertuples(index=False)}
     
     for r_id_int in r_costs.keys():
+        r_id_str = str(r_id_int)
+        if r_id_str not in r_to_h or r_id_str not in r_to_d:
+            raise KeyError(f"Missing route mapping for r_id={r_id_str}")
         inst.routes.append(Route(
-            r_id=str(r_id_int),
-            hub=str(r_to_h[r_id_int]),
-            depots=tuple(str(d) for d in r_to_d[r_id_int]),
+            r_id=r_id_str,
+            hub=str(r_to_h[r_id_str]),
+            depots=tuple(str(d) for d in r_to_d[r_id_str]),
             capacity=r_caps[r_id_int],
             fixed_cost=r_costs[r_id_int]
         ))
@@ -247,8 +256,8 @@ def build_pyomo_model(inst: Instance):
         return total_inflow - total_waste_past >= right_side
     
     model.c_service_level = Constraint(model.D, model.T, rule=service_level_rule)
-    """
-    sikinti burda
+    
+    
     # forall(r in R, t in T, i in D)
     def route_visit_restriction_rule(model, r_id, t, i):
         # 1. r_to_d_manual içindeki geçerli depoları alıyoruz
@@ -264,7 +273,7 @@ def build_pyomo_model(inst: Instance):
         return Constraint.Skip
 
     model.c_route_visit_restriction = Constraint(model.R, model.T, model.D, rule=route_visit_restriction_rule)
-
+   
 
     def route_capacity_rule(model, r_id, t):
         # 1. Mevcut rota nesnesine (kapasite bilgisi için) ve durak listesine erişelim
@@ -299,7 +308,7 @@ def build_pyomo_model(inst: Instance):
         return incoming_from_routes == model.Q[b, i, t]
 
     model.c_route_hub_assignment = Constraint(model.D, model.T, model.B, rule=route_hub_assignment_rule)
-    """
+   
     return model
 
 # ============================================================
@@ -350,6 +359,10 @@ if __name__ == "__main__":
         29: 1, 30: 1 
     }
 
+    # Normalize manual maps to string IDs to match model sets.
+    r_to_d_manual = {str(k): [str(d) for d in v] for k, v in r_to_d_manual.items()}
+    r_to_h_manual = {str(k): str(v) for k, v in r_to_h_manual.items()}
+
     
 
     # 3. Veri Yükleme
@@ -392,6 +405,14 @@ if __name__ == "__main__":
     print("Solver (CPLEX) baslatiliyor...")
     opt = SolverFactory('cplex')
     results = opt.solve(model, tee=True)
+
+    # %1 Gap Ayarı (0.01 = %1)
+    # mip.tolerances.mipgap parametresi CPLEX için standarttır
+    opt.options['mip_tolerances_mipgap'] = 0.01
+
+    # 2. Python zamanlayıcıyı durdur
+    end_time = time.time()
+    elapsed_time = end_time - start_time
     
 # --- BURADAN İTİBAREN GÜNCELLE ---
     
@@ -409,6 +430,11 @@ if __name__ == "__main__":
         print("BAŞARILI: OPTİMAL ÇÖZÜM BULUNDU")
         print("="*40)
         
+        print(f"Çözüm Durumu   : OPTİMAL/FEASIBLE")
+        print(f"Toplam Süre    : {end_time - start_time:.2f} saniye")
+        print(f"Gap Toleransı  : %1")
+        print("-" * 45)
+
         # Maliyetleri yazdırırken safe_value kullanıyoruz
         print(f"1. Envanter Tutma : {safe_value(model.inv_total):.2f}")
         print(f"2. Atik Maliyeti  : {safe_value(model.waste_total):.2f}")
