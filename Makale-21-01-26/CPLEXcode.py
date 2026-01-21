@@ -367,13 +367,17 @@ if __name__ == "__main__":
 
     # 3. Veri Yükleme
     print("\n--- Veri Yukleme Islemi Basliyor ---")
+    t0 = time.perf_counter()
     inst = load_instance_from_excel(
         file_name, r_to_d_manual, r_to_h_manual,
         alpha=0.995, cv=0.1, shelf_life=2, waste_cost=27.55696873 ,
         scenario_probs={1: 0.3, 2: 0.5, 3: 0.2}
     )
+    t1 = time.perf_counter()
+    print(f"[TIMER] load_instance_from_excel: {t1 - t0:.2f}s")
 
     # 4. Veri Kontrolü (Baş-Son 5 kaydı yazdırır)
+    t2 = time.perf_counter()
     print_debug_info("BETA (Assignment Cost)", inst.beta)
     print_debug_info("GAMA (Loading Cost)", inst.gamma)
     print_debug_info("SUPPLY (Tedarik)", inst.supply)
@@ -396,20 +400,28 @@ if __name__ == "__main__":
     print("    Son 5 Rota:")
     for r in inst.routes[-5:]:
         print(f"      ID: {r.r_id} | Hub: {r.hub} | Cap: {r.capacity} | Cost: {r.fixed_cost}")
+    t3 = time.perf_counter()
+    print(f"[TIMER] debug_prints: {t3 - t2:.2f}s")
 
     input("\nKonsoldaki veriler Excel ile ayni mi? Dogruysa Enter'a basarak cozumu baslatin...")
     # 5. Model Kurma ve Çözme
     print("\nPyomo modeli kuruluyor...")
+    t4 = time.perf_counter()
     model = build_pyomo_model(inst)
+    t5 = time.perf_counter()
+    print(f"[TIMER] build_pyomo_model: {t5 - t4:.2f}s")
     
     print("Solver (CPLEX) baslatiliyor...")
     opt = SolverFactory('cplex')
+    t6 = time.perf_counter()
     results = opt.solve(model, tee=True)
+    t7 = time.perf_counter()
+    print(f"[TIMER] solve: {t7 - t6:.2f}s")
 
     # %1 Gap Ayarı (0.01 = %1)
     # mip.tolerances.mipgap parametresi CPLEX için standarttır
-    opt.options['mip_tolerances_mipgap'] = 0.01
-
+    opt.options['mip_tolerances_mipgap'] = 0.05
+    opt.options['timelimit'] = 120
     # 2. Python zamanlayıcıyı durdur
     end_time = time.time()
     elapsed_time = end_time - start_time
