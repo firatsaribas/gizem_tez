@@ -59,7 +59,7 @@ class PhaseTimer:
         return False 
   
 # ============================================================ 
-# Small helpers (integer-safe) 
+# Small helpers (integer-safe) ggg
 # ============================================================ 
 
 def int_floor(x: float) -> int: 
