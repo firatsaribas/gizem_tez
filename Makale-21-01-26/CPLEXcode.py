@@ -248,7 +248,7 @@ def build_pyomo_model(inst: Instance):
     
     model.c_service_level = Constraint(model.D, model.T, rule=service_level_rule)
     """
-
+    sikinti burda
     # forall(r in R, t in T, i in D)
     def route_visit_restriction_rule(model, r_id, t, i):
         # 1. r_to_d_manual içindeki geçerli depoları alıyoruz
