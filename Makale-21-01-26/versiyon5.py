@@ -1,13 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Jan 18 20:47:58 2026
 
-@author: gizem
-"""
 
 # -*- coding: utf-8 -*- 
-
-
 
 from dataclasses import dataclass, field 
 from typing import Dict, List, Tuple, Set 
@@ -1713,7 +1706,7 @@ if __name__ == "__main__":
 # QUICK DIAGNOSTIC PACK (BUG var mı?)
 # =========================================================
 
-import math
+
 
 def quick_diagnostics(inst, sol, REQ):
     print("\n" + "="*80)
