@@ -477,96 +477,83 @@ def inbound_assign_greedy_one_scenario_int(
 
     return Y_s, L_s, achieved
   
-def greedy_route_selection_and_loading_int(inst: Instance, t: int, qmin: Dict[str, float]) -> Tuple[Dict, Dict, Dict]:
-    X_t, Z_t = {}, {}
-    Q_t = {(b, i, t): 0 for b in inst.B for i in inst.D}
+def greedy_route_selection_and_loading_int( 
+    inst: Instance, 
+    t: int, 
+    qmin: Dict[str, float], 
+) -> Tuple[ 
+    Dict[Tuple[str, int], int], 
+    Dict[Tuple[str, str, int], int], 
+    Dict[Tuple[str, str, int], int] 
+]: 
 
-    r_deps = {r.r_id: set(r.depots) for r in inst.routes}
-    r_cost = {r.r_id: float(r.fixed_cost) for r in inst.routes}
-    r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes}
-    r_hub  = {r.r_id: r.hub for r in inst.routes}
+    """ 
+    Select routes by score = sum_{i in Nr∩U} qmin_i / lambda_r (maximize), 
+    then load int quantities Z respecting route capacity, build Q = sum_{r:hub=b} Z. 
+    """ 
 
-    # --- EKSİK 1: Yardımcı Fonksiyon Tanımı ---
-    def build_ZQ_for_selected(selected_routes: List[str]):
-        Z_local = {}
-        Q_local = {(b, i, t): 0 for b in inst.B for i in inst.D}
-        rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+    U = {i for i, v in qmin.items() if v > 1e-9}  
 
-        for r_id in selected_routes:
-            cap = r_cap[r_id]
-            # Önce en yüksek ihtiyacı olan depoyu doldur (Verimlilik için)
-            deps = sorted([i for i in r_deps[r_id] if rem[i] > 1e-9], 
-                          key=lambda i: rem[i], reverse=True)
-            for i in deps:
-                if cap <= 0: break
-                take = int_floor(min(rem[i], cap))
-                if take > 0:
-                    Z_local[(i, r_id, t)] = Z_local.get((i, r_id, t), 0) + take
-                    rem[i] -= take
-                    cap -= take
-        
-        for (i, r_id, tt), z in Z_local.items():
-            b = r_hub[r_id]
-            Q_local[(b, i, tt)] += int(z)
-            
-        delivered = {i: sum(int(Q_local.get((b, i, t), 0)) for b in inst.B) for i in inst.D}
-        return Z_local, Q_local, delivered
+    X_t: Dict[Tuple[str, int], int] = {} 
+    Z_t: Dict[Tuple[str, str, int], int] = {} 
+    Q_t: Dict[Tuple[str, str, int], int] = {(b, i, t): 0 for b in inst.B for i in inst.D}  
 
-    # 1) ROTA SEÇİMİ
-    selected = []
-    need = {i: float(qmin.get(i, 0.0)) for i in inst.D}
-    U = {i for i in inst.D if need[i] > 1e-9}
+    r_deps = {r.r_id: set(r.depots) for r in inst.routes} 
+    r_cost = {r.r_id: r.fixed_cost for r in inst.routes} 
+    r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes} 
+    r_hub  = {r.r_id: r.hub for r in inst.routes} 
 
-    while U:
-        best_r, best_score = None, -1.0
-        for r in inst.routes:
-            cover = r_deps[r.r_id] & U
-            if not cover: continue
-            urgent_sum = sum(need[i] for i in cover)
-            
-            # SKOR: Kapasite kullanımını maksimize et
-            utilization = urgent_sum / r_cap[r.r_id]
-            score = (urgent_sum / r_cost[r.r_id]) * (utilization ** 2) 
-            
-            if score > best_score:
-                best_score, best_r = score, r.r_id
+  
+    # 1) greedy set-cover 
+    selected: List[str] = [] 
+    while U: 
+        best_r = None 
+        best_score = -1.0 
 
-        if best_r is None: break
-        selected.append(best_r)
-        
-        # Kapasiteye göre ihtiyacı tüket (Simülasyon)
-        cap_left = float(r_cap[best_r])
-        deps = sorted(list(r_deps[best_r] & U), key=lambda i: need[i], reverse=True)
-        for i in deps:
-            take = min(need[i], cap_left)
-            need[i] -= take
-            cap_left -= take
-        U = {i for i in inst.D if need[i] > 1e-9}
+        for r in inst.routes: 
+            cover = r_deps[r.r_id] & U 
+            cover_sum = sum(qmin[i] for i in cover) 
+            if cover_sum <= 1e-12: 
+                continue 
 
-    # 2) SAFE DROP (Eleme)
-    Z_temp, Q_temp, delivered_base = build_ZQ_for_selected(selected)
-    improved = True
-    while improved and len(selected) > 1:
-        improved = False
-        # Doluluk oranı düşük olan rotaları öncelikli ele (Maliyet tasarrufu)
-        sorted_to_drop = sorted(selected, key=lambda r: sum(v for (i, rid, tt), v in Z_temp.items() if rid == r) / r_cap[r])
-        for r_drop in sorted_to_drop:
-            test_sel = [r for r in selected if r != r_drop]
-            Z_test, Q_test, delivered_test = build_ZQ_for_selected(test_sel)
-            
-            # Tolerans kontrolü
-            if all(delivered_test[i] >= delivered_base[i] - 2 for i in inst.D):
-                selected = test_sel
-                Z_temp, Q_temp, delivered_base = Z_test, Q_test, delivered_test
-                improved = True
+            score = cover_sum / max(1e-12, r_cost[r.r_id]) 
+            if score > best_score: 
+                best_score = score 
+                best_r = r.r_id 
+
+        if best_r is None: 
+            break 
+
+        selected.append(best_r) 
+        X_t[(best_r, t)] = 1 
+        U = U - r_deps[best_r] 
+
+  
+    # 2) load routes (int) 
+    rem = {i: float(qmin.get(i, 0.0)) for i in inst.D} 
+
+    for r_id in selected: 
+        cap = r_cap[r_id] 
+        deps = [i for i in r_deps[r_id] if rem[i] > 1e-9] 
+        deps.sort(key=lambda i: rem[i], reverse=True) 
+
+        for i in deps: 
+            if cap <= 0: 
                 break 
+            x = min(rem[i], cap) 
+            x_int = int_floor(x) 
+            if x_int > 0: 
+                Z_t[(i, r_id, t)] = Z_t.get((i, r_id, t), 0) + x_int 
+                rem[i] -= x_int 
+                cap -= x_int 
 
-    # --- EKSİK 2: X_t Güncellemesi ve Final Değişkenler ---
-    X_t = {(r_id, t): 1 for r_id in selected}
-    Z_t = Z_temp
-    Q_t = Q_temp
 
-    return X_t, Z_t, Q_t
+    # 3) induce Q 
+    for (i, r_id, tt), z in Z_t.items(): 
+        b = r_hub[r_id] 
+        Q_t[(b, i, tt)] += int(z)   
+
+    return X_t, Z_t, Q_t 
 
   
 
