@@ -374,129 +374,11 @@ def fifo_update_int(age_buckets: List[int], receipt: int, demand: int) -> Tuple[
 
   
 
-def greedy_route_selection_and_loading_int(
-    inst: Instance,
-    t: int,
-    qmin: Dict[str, float],
-) -> Tuple[
-    Dict[Tuple[str, int], int],
-    Dict[Tuple[str, str, int], int],
-    Dict[Tuple[str, str, int], int]
-]:
-    """
-    Karsılastırma Analizi İçin İyilestirilmis Versiyon:
-    1. İsimlendirme: X_t, Z_t, Q_t standartlarına tam uyum.
-    2. Skorlama: Mevcut beta ve gamma parametrelerini kullanarak hub giris maliyetini tahmin eder.
-    3. Safe Drop: Verimsiz rotaları en düşük doluluktan baslayarak eler.
-    """
+import math
+from typing import Dict, Tuple, List
 
-    X_t: Dict[Tuple[str, int], int] = {}
-    Z_t: Dict[Tuple[str, str, int], int] = {}
-    Q_t: Dict[Tuple[str, str, int], int] = {(b, i, t): 0 for b in inst.B for i in inst.D}
-
-    r_deps = {r.r_id: set(r.depots) for r in inst.routes}
-    r_cost = {r.r_id: float(r.fixed_cost) for r in inst.routes}
-    r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes}
-    r_hub  = {r.r_id: r.hub for r in inst.routes}
-
-    # ------------------------------------------------------------
-    # Helper: Belirli bir rota seti için tam sayı Z/Q olusturur
-    # ------------------------------------------------------------
-    def build_ZQ_for_selected(selected_routes: List[str]):
-        Z_local: Dict[Tuple[str, str, int], int] = {}
-        Q_local: Dict[Tuple[str, str, int], int] = {(b, i, t): 0 for b in inst.B for i in inst.D}
-        rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
-
-        for r_id in selected_routes:
-            cap = r_cap[r_id]
-            deps = sorted([i for i in r_deps[r_id] if rem[i] > 1e-9], key=lambda i: rem[i], reverse=True)
-
-            for i in deps:
-                if cap <= 0: break
-                take = int_floor(min(rem[i], cap))
-                if take > 0:
-                    Z_local[(i, r_id, t)] = Z_local.get((i, r_id, t), 0) + take
-                    rem[i] -= take
-                    cap -= take
-
-        for (i, r_id, tt), z in Z_local.items():
-            b = r_hub[r_id]
-            Q_local[(b, i, tt)] += int(z)
-
-        delivered = {i: sum(int(Q_local.get((b, i, t), 0)) for b in inst.B) for i in inst.D}
-        return Z_local, Q_local, delivered
-
-    # 1) Rota Seçimi (Maliyet Duyarlı Skorlama)
-    selected: List[str] = []
-    need = {i: float(qmin.get(i, 0.0)) for i in inst.D}
-    U = {i for i in inst.D if need[i] > 1e-9}
-
-    while U:
-        best_r = None
-        best_score = -1.0
-        for r in inst.routes:
-            cover = r_deps[r.r_id] & U
-            if not cover: continue
-            urgent_sum = sum(need[i] for i in cover)
-            
-            # Hub giris maliyetini mevcut beta ve gamma'dan tahmin et (Parametre eklemeden)
-            b_id = r_hub[r.r_id]
-            inbound_est = min([inst.beta.get((f, k), 0) + inst.gamma.get((f, b_id, k), 0) * (urgent_sum/len(cover))
-                             for f in inst.F for k in inst.K if (f, b_id) in inst.allowed_f_b] or [0])
-            
-            # Skor: Kapasite kullanımını (utilization) ödüllendir
-            utilization = urgent_sum / r_cap[r.r_id]
-            score = (urgent_sum / (r_cost[r.r_id] + inbound_est)) * (utilization ** 2)
-            
-            if score > best_score:
-                best_score, best_r = score, r.r_id
-
-        if best_r is None: break
-        selected.append(best_r)
-        
-        # Kapasite kullanımını takip et
-        cap_left = float(r_cap[best_r])
-        deps_to_serve = sorted(list(r_deps[best_r] & U), key=lambda i: need[i], reverse=True)
-        for i in deps_to_serve:
-            if cap_left <= 0: break
-            take = min(need[i], cap_left)
-            need[i] -= take
-            cap_left -= take
-        U = {i for i in inst.D if need[i] > 1e-9}
-
-    # 2) Safe Drop (Maliyet ve Verimlilik Odaklı Eleme)
-    Z_temp, Q_temp, delivered_base = build_ZQ_for_selected(selected)
-    
-    improved = True
-    while improved and len(selected) > 1:
-        improved = False
-        # Rotaları en düsük doluluktan (utilization) baslayarak eliyoruz
-        sorted_to_drop = sorted(selected, key=lambda r: sum(v for (i, rid, tt), v in Z_temp.items() if rid == r) / r_cap[r])
-        
-        for r_drop in sorted_to_drop:
-            test_sel = [r for r in selected if r != r_drop]
-            Z_test, Q_test, delivered_test = build_ZQ_for_selected(test_sel)
-            
-            # Güvenlik kosulu: Servis seviyesi HİÇ bozulmamalı (Birebir karsılastırma için)
-            if all(delivered_test[i] >= delivered_base[i] for i in inst.D):
-                selected = test_sel
-                Z_temp, Q_temp, delivered_base = Z_test, Q_test, delivered_test
-                improved = True
-                break 
-
-    # 3) Final Çıktıları Standart İsimlere Ata
-    for r_id in selected:
-        X_t[(r_id, t)] = 1
-    
-    Z_t = Z_temp
-    Q_t = Q_temp
-
-    return X_t, Z_t, Q_t
-  
-
-  
 def inbound_assign_greedy_one_scenario_int(
-    inst: Instance,
+    inst,
     s: str,
     t: int,
     OUT_bt: Dict[str, int],
@@ -506,72 +388,185 @@ def inbound_assign_greedy_one_scenario_int(
     Dict[str, int]
 ]:
     """
-    İYİLEŞTİRİLMİŞ ATAMA: 
-    Araçları (k) seçerken birim taşıma maliyetini (Total Cost / Load) minimize eder.
-    Bu sayede yüksek kapasiteli araçların az yükle atanmasını (assignmentcost şişmesini) engeller.
+    NET REGRET (FIRSAT MALİYETİ) TABANLI HİBRİT ATAMA:
+    - Optimizasyonun 4.309 € seviyesindeki 'assignmentcost' değerini hedefler.
+    - Lojistik Kayıp (Regret) ve Ürün Kaybı (Waste Risk) dengesini kurar.
+    - Her adımda en kritik atamayı (en yüksek skorlu) seçer.
     """
+    
+    # Tam sayı kısıtı için yardımcı fonksiyon
+    def int_floor(x): return int(math.floor(x + 1e-9))
+
     cap_left = {k: int_floor(inst.theta[k]) for k in inst.K}
     used_f = set()
+    # Aracın aynı periyotta sadece tek bir hub'a gitmesini sağlar
     vehicle_hub: Dict[str, str] = {k: None for k in inst.K}
 
     Y_s: Dict[Tuple[str, str, str, str, int], int] = {}
     L_s: Dict[Tuple[str, str, str, str, int], int] = {}
     achieved = {b: 0 for b in inst.B}
 
-    # Hub'ları talep büyüklüğüne göre sırala
-    hubs_sorted = sorted(inst.B, key=lambda b: OUT_bt.get(b, 0), reverse=True)
+    # Hub ihtiyaçlarını güncel OUT_bt üzerinden al
+    hub_needs = {b: int(OUT_bt.get(b, 0)) for b in inst.B if OUT_bt.get(b, 0) > 0}
+    
+    # Atama Döngüsü: Kritiklik skorlarına göre dinamik atama
+    while hub_needs:
+        regret_list = []
 
-    for b in hubs_sorted:
-        remaining = int(OUT_bt.get(b, 0))
-        if remaining <= 0: continue
+        for b, remaining in list(hub_needs.items()):
+            for f in inst.F:
+                if f in used_f: continue
+                
+                # Tedarikçi stoğunu al ve tam sayıya yuvarla
+                v_val = inst.supply.get((f, s, t), 0.0)
+                v = int_floor(v_val)
+                if v <= 0 or (f, b) not in inst.allowed_f_b: continue
 
-        # Aday tedarikçileri filtrele ve en büyük tedarik kapasitesine göre sırala
-        cand_f = []
-        for f in inst.F:
-            if f in used_f: continue
-            v = int_floor(inst.supply.get((f, s, t), 0.0))
-            if v > 0 and (f, b) in inst.allowed_f_b:
-                cand_f.append((f, v))
+                costs_for_this_pair = []
+                max_to_ship = min(v, remaining)
+                
+                # Mevcut araçlar (k) arasında maliyet ve kapasite analizi
+                for k in inst.K:
+                    if cap_left[k] <= 0: continue
+                    if vehicle_hub[k] is not None and vehicle_hub[k] != b: continue
+                    if (f, k) not in inst.beta or (f, b, k) not in inst.gamma: continue
+                    
+                    actual_ship = min(max_to_ship, cap_left[k])
+                    # Maliyet = Sabit Atama (beta) + Değişken Taşıma (gamma * miktar)
+                    total_c = inst.beta[(f, k)] + inst.gamma[(f, b, k)] * actual_ship
+                    costs_for_this_pair.append((total_c, k, actual_ship))
+
+                if not costs_for_this_pair: continue
+                
+                # Regret (Fırsat Maliyeti) Hesaplama
+                costs_for_this_pair.sort() # Maliyete göre küçükten büyüğe
+                best_cost, best_k, best_ship = costs_for_this_pair[0]
+                
+                # İkinci seçenek yoksa, bu araç 'vazgeçilmezdir' (Yüksek regret puanı)
+                second_best_cost = costs_for_this_pair[1][0] if len(costs_for_this_pair) > 1 else best_cost * 2.0
+                
+                logistic_regret = second_best_cost - best_cost
+                
+                # WASTE RISK: m=2 olduğu için bugün gitmeyen ürünün fire olma maliyeti
+                # 'waste_cost' parametresini kullanıyoruz.
+                waste_risk = best_ship * inst.waste_cost 
+                
+                # Toplam Kritiklik Skoru: Lojistik Kayıp + Ürün Kaybı
+                total_regret_score = logistic_regret + waste_risk
+                regret_list.append((total_regret_score, b, f, best_k, best_ship))
+
+        if not regret_list:
+            break
+
+        # Regret skoru en yüksek (en kritik) atamayı seç ve gerçekleştir
+        regret_list.sort(key=lambda x: x[0], reverse=True)
+        score, b, f, k, ship = regret_list[0]
+
+        # Kararı işle ve değişkenleri güncelle
+        Y_s[(f, b, k, s, t)] = 1
+        L_s[(f, b, k, s, t)] = int(ship)
+        cap_left[k] -= int(ship)
+        vehicle_hub[k] = b 
+        used_f.add(f)
+        achieved[b] += int(ship)
         
-        cand_f.sort(key=lambda x: x[1], reverse=True)
-
-        for f, v in cand_f:
-            if remaining <= 0: break
-            
-            best_k = None
-            min_unit_cost = float("inf")
-            best_ship = 0
-            
-            for k in inst.K:
-                # Araç kapasitesi veya başka hub kilidi kontrolü
-                if cap_left[k] <= 0: continue
-                if vehicle_hub[k] is not None and vehicle_hub[k] != b: continue
-                if (f, k) not in inst.beta or (f, b, k) not in inst.gamma: continue
-
-                ship = min(v, remaining, cap_left[k])
-                if ship <= 0: continue
-
-                # SKOR: (Sabit Atama + Değişken Taşıma) / Yüklenen Miktar
-                # Bu mantık, yüksek beta maliyetini daha fazla yüke bölerek verimliliği ödüllendirir.
-                total_cost = inst.beta[(f, k)] + inst.gamma[(f, b, k)] * ship
-                unit_cost = total_cost / ship 
-
-                if unit_cost < min_unit_cost:
-                    min_unit_cost = unit_cost
-                    best_k = k
-                    best_ship = int(ship)
-
-            if best_k:
-                Y_s[(f, b, best_k, s, t)] = 1
-                L_s[(f, b, best_k, s, t)] = best_ship
-                cap_left[best_k] -= best_ship
-                vehicle_hub[best_k] = b # Aracı bu hub için kilitle
-                used_f.add(f)
-                achieved[b] += best_ship
-                remaining -= best_ship
+        # Hub ihtiyacını azalt
+        hub_needs[b] -= int(ship)
+        if hub_needs[b] <= 0:
+            del hub_needs[b]
 
     return Y_s, L_s, achieved
+  
+def greedy_route_selection_and_loading_int(inst: Instance, t: int, qmin: Dict[str, float]) -> Tuple[Dict, Dict, Dict]:
+    X_t, Z_t = {}, {}
+    Q_t = {(b, i, t): 0 for b in inst.B for i in inst.D}
 
+    r_deps = {r.r_id: set(r.depots) for r in inst.routes}
+    r_cost = {r.r_id: float(r.fixed_cost) for r in inst.routes}
+    r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes}
+    r_hub  = {r.r_id: r.hub for r in inst.routes}
+
+    # --- EKSİK 1: Yardımcı Fonksiyon Tanımı ---
+    def build_ZQ_for_selected(selected_routes: List[str]):
+        Z_local = {}
+        Q_local = {(b, i, t): 0 for b in inst.B for i in inst.D}
+        rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+
+        for r_id in selected_routes:
+            cap = r_cap[r_id]
+            # Önce en yüksek ihtiyacı olan depoyu doldur (Verimlilik için)
+            deps = sorted([i for i in r_deps[r_id] if rem[i] > 1e-9], 
+                          key=lambda i: rem[i], reverse=True)
+            for i in deps:
+                if cap <= 0: break
+                take = int_floor(min(rem[i], cap))
+                if take > 0:
+                    Z_local[(i, r_id, t)] = Z_local.get((i, r_id, t), 0) + take
+                    rem[i] -= take
+                    cap -= take
+        
+        for (i, r_id, tt), z in Z_local.items():
+            b = r_hub[r_id]
+            Q_local[(b, i, tt)] += int(z)
+            
+        delivered = {i: sum(int(Q_local.get((b, i, t), 0)) for b in inst.B) for i in inst.D}
+        return Z_local, Q_local, delivered
+
+    # 1) ROTA SEÇİMİ
+    selected = []
+    need = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+    U = {i for i in inst.D if need[i] > 1e-9}
+
+    while U:
+        best_r, best_score = None, -1.0
+        for r in inst.routes:
+            cover = r_deps[r.r_id] & U
+            if not cover: continue
+            urgent_sum = sum(need[i] for i in cover)
+            
+            # SKOR: Kapasite kullanımını maksimize et
+            utilization = urgent_sum / r_cap[r.r_id]
+            score = (urgent_sum / r_cost[r.r_id]) * (utilization ** 2) 
+            
+            if score > best_score:
+                best_score, best_r = score, r.r_id
+
+        if best_r is None: break
+        selected.append(best_r)
+        
+        # Kapasiteye göre ihtiyacı tüket (Simülasyon)
+        cap_left = float(r_cap[best_r])
+        deps = sorted(list(r_deps[best_r] & U), key=lambda i: need[i], reverse=True)
+        for i in deps:
+            take = min(need[i], cap_left)
+            need[i] -= take
+            cap_left -= take
+        U = {i for i in inst.D if need[i] > 1e-9}
+
+    # 2) SAFE DROP (Eleme)
+    Z_temp, Q_temp, delivered_base = build_ZQ_for_selected(selected)
+    improved = True
+    while improved and len(selected) > 1:
+        improved = False
+        # Doluluk oranı düşük olan rotaları öncelikli ele (Maliyet tasarrufu)
+        sorted_to_drop = sorted(selected, key=lambda r: sum(v for (i, rid, tt), v in Z_temp.items() if rid == r) / r_cap[r])
+        for r_drop in sorted_to_drop:
+            test_sel = [r for r in selected if r != r_drop]
+            Z_test, Q_test, delivered_test = build_ZQ_for_selected(test_sel)
+            
+            # Tolerans kontrolü
+            if all(delivered_test[i] >= delivered_base[i] - 2 for i in inst.D):
+                selected = test_sel
+                Z_temp, Q_temp, delivered_base = Z_test, Q_test, delivered_test
+                improved = True
+                break 
+
+    # --- EKSİK 2: X_t Güncellemesi ve Final Değişkenler ---
+    X_t = {(r_id, t): 1 for r_id in selected}
+    Z_t = Z_temp
+    Q_t = Q_temp
+
+    return X_t, Z_t, Q_t
 
   
 
@@ -1438,7 +1433,7 @@ def export_solution_to_excel(
 
     REQ: Dict[Tuple[str, int], float], 
 
-    out_path: str = "ffh_solution_export.xlsx" 
+    out_path: str = "ffh_solution_gemini.xlsx" 
 
 ) -> None: 
 
@@ -1748,7 +1743,7 @@ print("Total depots with violation:", len(bad))
 
     # Export (includes checks + both cost breakdowns) 
 
-export_solution_to_excel(inst, sol, REQ, out_path="ffh_solution_export.xlsx") 
+export_solution_to_excel(inst, sol, REQ, out_path="ffh_solution_gemini.xlsx") 
 
   
 
