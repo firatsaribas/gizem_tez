@@ -1,5 +1,8 @@
 import random
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # =========================
 # 0) INPUT: mevcut 30 rota
@@ -60,7 +63,7 @@ def normalize_route(depots):
     return out
 
 def mutate_route(depots, hub, min_len=3, max_len=6):
-    depots = depots[:]  # copy
+    depots = depots[:]
     op = random.choice(["swap", "add", "remove", "replace"])
 
     if op == "swap" and len(depots) >= 2:
@@ -82,7 +85,6 @@ def mutate_route(depots, hub, min_len=3, max_len=6):
 
     depots = normalize_route(depots)
 
-    # uzunluğu min/max aralığına çek
     if len(depots) < min_len:
         cand = [d for d in ALL_DEPOTS if d not in depots]
         random.shuffle(cand)
@@ -107,12 +109,14 @@ def merge_routes(a, b, min_len=3, max_len=6):
     return merged
 
 def signature(hub, depots):
-    """Aynı rotayı tekrar üretmemek için imza (hub + sıra)."""
-    return (hub, tuple(depots))
+    """Hub + depo kümesi (sıra önemsiz)"""
+    return (hub, tuple(sorted(depots)))
 
-def expand_routes_to_100(route_to_am, route_to_depots, target=100, seed=42,
-                         min_len=3, max_len=6,
-                         n_mutate=30, n_random=25, n_merge=15):
+def expand_routes_to_target(route_to_am, route_to_depots,
+                             target=500, seed=42,
+                             min_len=3, max_len=6,
+                             n_mutate=150, n_random=150, n_merge=80):
+
     random.seed(seed)
 
     new_am = dict(route_to_am)
@@ -173,8 +177,13 @@ def expand_routes_to_100(route_to_am, route_to_depots, target=100, seed=42,
         by_hub[hub].append(next_id)
         next_id += 1
 
-    # Fill remaining
+    # Fill remaining up to target
+    attempts = 0
     while next_id <= target:
+        attempts += 1
+        if attempts > 100000:
+            print(f"WARNING: Could only generate {next_id - 1} unique routes before exhausting attempts.")
+            break
         if random.random() < 0.5:
             r0 = random.choice(list(new_dep.keys()))
             hub = new_am[r0]
@@ -193,48 +202,222 @@ def expand_routes_to_100(route_to_am, route_to_depots, target=100, seed=42,
 
     return new_am, new_dep
 
-route_to_am_100, route_to_depots_100 = expand_routes_to_100(
+# =========================
+# 2) 500 rota üret
+# =========================
+route_to_am_500, route_to_depots_500 = expand_routes_to_target(
     route_to_am_30, route_to_depots_30,
-    target=100, seed=7,
+    target=500, seed=7,
     min_len=3, max_len=6,
-    n_mutate=30, n_random=25, n_merge=15
+    n_mutate=150, n_random=150, n_merge=80
 )
 
+print(f"Toplam üretilen rota sayısı: {len(route_to_depots_500)}")
 
 # =========================
-# 2) rotalarr.csv formatına çevir (birebir)
+# 3) rotalarr.csv formatına çevir
 # =========================
-RETURN_TO_HUB = False  # dönüş istersen True yap (en sona yine "Bölge birliği X" ekler)
+RETURN_TO_HUB = False
 
-def build_route_points(hub_id: int, depots: list[int]) -> list[str]:
-    # İSTENEN FORMAT:
-    # "Bölge birliği 2", "Depo 25", ...
+def build_route_points(hub_id: int, depots: list) -> list:
     pts = [f"Bölge birliği {hub_id}"] + [f"Depo {d}" for d in depots]
     if RETURN_TO_HUB:
-        pts.append(f"Bölge birliği {hub_id}")  # H2 değil! Noktalar.csv ile aynı isim
+        pts.append(f"Bölge birliği {hub_id}")
     return pts
 
 rotalarr_lines = []
-for rid in range(1, 101):
-    hub_id = route_to_am_100[rid]
-    depots = route_to_depots_100[rid]
+for rid in range(1, 501):
+    hub_id = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
     points = build_route_points(hub_id, depots)
-
-    # CSV satırını birebir senin formatında yaz (header yok)
     line = ",".join([f"Rota {rid}"] + points)
     rotalarr_lines.append(line)
 
-rotalarr_out = "rotalarr_generated.csv"
+rotalarr_out = "rotalarr_500_generated.csv"
 with open(rotalarr_out, "w", encoding="utf-8-sig") as f:
     f.write("\n".join(rotalarr_lines))
 
-print("Yazıldı:", rotalarr_out)
-print("Örnek ilk 4 satır:")
-for x in rotalarr_lines[:4]:
-    print(x)
+print("CSV yazıldı: rotalarr_500_generated.csv")
 
+
+# =========================
+# 4) Excel çıktısı — 4 sayfa
+# =========================
+
+# --- Stil sabitleri ---
+HEADER_FILL  = PatternFill("solid", start_color="2E4057")   # koyu lacivert
+SUBHEAD_FILL = PatternFill("solid", start_color="048A81")   # teal
+ALT_FILL     = PatternFill("solid", start_color="EAF4F4")   # açık mint
+WHITE_FILL   = PatternFill("solid", start_color="FFFFFF")
+HUB_COLORS   = {1: "F4A261", 2: "2A9D8F", 3: "E76F51"}     # hub renk rozeti
+
+thin   = Side(style="thin", color="CCCCCC")
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+def hdr_font(size=11, bold=True, color="FFFFFF"):
+    return Font(name="Arial", size=size, bold=bold, color=color)
+
+def body_font(size=10, bold=False, color="1A1A2E"):
+    return Font(name="Arial", size=size, bold=bold, color=color)
+
+def style_header_row(ws, row, cols, fill=HEADER_FILL):
+    for col in range(1, cols + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = fill
+        cell.font = hdr_font()
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
+
+def style_data_cell(ws, row, col, value, alt=False, bold=False, align="center"):
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.fill = ALT_FILL if alt else WHITE_FILL
+    cell.font = body_font(bold=bold)
+    cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
+    cell.border = BORDER
+    return cell
+
+def add_title_banner(ws, text, merge_range):
+    ws.merge_cells(merge_range)
+    first_cell = ws[merge_range.split(":")[0]]
+    first_cell.value = text
+    first_cell.font = hdr_font(size=14)
+    first_cell.fill = HEADER_FILL
+    first_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+wb = Workbook()
+
+# ----------------------------------------------------------
+# Sayfa 1 — Ham Veri
+# ----------------------------------------------------------
+ws1 = wb.active
+ws1.title = "Raw Data"
+ws1.freeze_panes = "A3"
+ws1.row_dimensions[1].height = 30
+ws1.row_dimensions[2].height = 20
+
+add_title_banner(ws1, "500 Route Dataset — Raw Data", "A1:I1")
+
+headers1 = ["Route No", "Starting Hub", "No. of Depots",
+            "Depot 1", "Depot 2", "Depot 3", "Depot 4", "Depot 5", "Depot 6"]
+for col, h in enumerate(headers1, 1):
+    ws1.cell(row=2, column=col, value=h)
+style_header_row(ws1, 2, len(headers1), fill=SUBHEAD_FILL)
+
+for i, rid in enumerate(range(1, 501)):
+    row = i + 3
+    alt = (i % 2 == 1)
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
+
+    style_data_cell(ws1, row, 1, rid,        alt, bold=True)
+    hub_cell = style_data_cell(ws1, row, 2, hub, alt)
+    hub_cell.fill = PatternFill("solid", start_color=HUB_COLORS[hub])
+    hub_cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    style_data_cell(ws1, row, 3, len(depots), alt)
+    for j, d in enumerate(depots):
+        style_data_cell(ws1, row, 4 + j, d, alt)
+    for j in range(len(depots), 6):
+        style_data_cell(ws1, row, 4 + j, "", alt)
+
+for i, w in enumerate([10, 14, 13, 9, 9, 9, 9, 9, 9], 1):
+    ws1.column_dimensions[get_column_letter(i)].width = w
+
+# ----------------------------------------------------------
+# Sayfa 2 — Python Stili:  route_no: hub  /  route_no: [depots]
+# ----------------------------------------------------------
+ws2 = wb.create_sheet("Python Style")
+ws2.freeze_panes = "A3"
+ws2.row_dimensions[1].height = 30
+ws2.row_dimensions[2].height = 20
+
+add_title_banner(ws2, "Python Style Notation", "A1:C1")
+
+for col, h in enumerate(["Route No", "route_no: hub", "route_no: [depots]"], 1):
+    ws2.cell(row=2, column=col, value=h)
+style_header_row(ws2, 2, 3, fill=SUBHEAD_FILL)
+
+for i, rid in enumerate(range(1, 501)):
+    row = i + 3
+    alt    = (i % 2 == 1)
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
+    style_data_cell(ws2, row, 1, rid,                    alt, bold=True)
+    style_data_cell(ws2, row, 2, f"{rid}: {hub}",        alt, align="left")
+    style_data_cell(ws2, row, 3, f"{rid}: {depots}",     alt, align="left")
+
+ws2.column_dimensions["A"].width = 10
+ws2.column_dimensions["B"].width = 18
+ws2.column_dimensions["C"].width = 55
+
+# ----------------------------------------------------------
+# Sayfa 3 — OPL Stili:  <route_no, hub, {depots}>
+# ----------------------------------------------------------
+ws3 = wb.create_sheet("OPL Style")
+ws3.freeze_panes = "A3"
+ws3.row_dimensions[1].height = 30
+ws3.row_dimensions[2].height = 20
+
+add_title_banner(ws3, "OPL Style Notation", "A1:B1")
+
+for col, h in enumerate(["Route No", "<route_no, hub, {depots}>"], 1):
+    ws3.cell(row=2, column=col, value=h)
+style_header_row(ws3, 2, 2, fill=SUBHEAD_FILL)
+
+for i, rid in enumerate(range(1, 501)):
+    row = i + 3
+    alt    = (i % 2 == 1)
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
+    depot_set = "{" + ",".join(str(d) for d in depots) + "}"
+    opl_str   = f"<{rid},{hub},{depot_set}>"
+    style_data_cell(ws3, row, 1, rid,     alt, bold=True)
+    style_data_cell(ws3, row, 2, opl_str, alt, align="left")
+
+ws3.column_dimensions["A"].width = 10
+ws3.column_dimensions["B"].width = 55
+
+# ----------------------------------------------------------
+# Sayfa 4 — Birleşik Görünüm (tüm notasyonlar yan yana)
+# ----------------------------------------------------------
+ws4 = wb.create_sheet("Combined View")
+ws4.freeze_panes = "A3"
+ws4.row_dimensions[1].height = 30
+ws4.row_dimensions[2].height = 20
+
+add_title_banner(ws4, "All Notation Styles — Combined View", "A1:D1")
+
+for col, h in enumerate(["Route No", "route_no: hub",
+                          "route_no: [depots]", "<route_no, hub, {depots}>"], 1):
+    ws4.cell(row=2, column=col, value=h)
+style_header_row(ws4, 2, 4, fill=SUBHEAD_FILL)
+
+for i, rid in enumerate(range(1, 501)):
+    row = i + 3
+    alt    = (i % 2 == 1)
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
+    depot_set = "{" + ",".join(str(d) for d in depots) + "}"
+    opl_str   = f"<{rid},{hub},{depot_set}>"
+    style_data_cell(ws4, row, 1, rid,                alt, bold=True)
+    style_data_cell(ws4, row, 2, f"{rid}: {hub}",   alt, align="left")
+    style_data_cell(ws4, row, 3, f"{rid}: {depots}", alt, align="left")
+    style_data_cell(ws4, row, 4, opl_str,            alt, align="left")
+
+ws4.column_dimensions["A"].width = 10
+ws4.column_dimensions["B"].width = 18
+ws4.column_dimensions["C"].width = 50
+ws4.column_dimensions["D"].width = 55
+
+# ----------------------------------------------------------
+# Kaydet
+# ----------------------------------------------------------
+excel_out = "routes_500.xlsx"
+wb.save(excel_out)
+print(f"Excel yazıldı: {excel_out}")
 '''
 
+
+#r'''
 # =========================
 # 3) Noktalar.csv oku (birebir) + geodesic
 # =========================
@@ -244,7 +427,7 @@ import os
 
 # ---- DOSYA YOLLARI ----
 noktalar_file = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\Noktalar.csv"
-rotalar_file  = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\rotalarr.csv"
+rotalar_file  = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\rotalarr500.csv"
 
 def clean_name(x):
     return str(x).replace("\u00a0", " ").strip()
@@ -358,10 +541,11 @@ df_out = pd.DataFrame(rows_out)
 # =========================
 # 5) ÇIKTI
 # =========================
-output_excel = "routes_analysis_results.xlsx"
+output_excel = "routes_analysis_results500.xlsx"
 with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
     df_out.to_excel(writer, sheet_name="Analiz Sonuclari", index=False)
     df_rotalar.to_excel(writer, sheet_name="Okunan Rotalar", index=False)
 
 print(f"✅ Analiz tamamlandı ve '{output_excel}' dosyasına kaydedildi.")
 print(df_out[["route_name", "distance_km", "route_cost_eur"]].head())
+#'''
