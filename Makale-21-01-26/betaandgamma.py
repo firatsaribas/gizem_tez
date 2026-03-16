@@ -96,7 +96,7 @@ for f in supplier_names:
         for k in vehicle_supplier_names:
             fuel_fk   = cost_matrix.loc[f, k]
             fuel_kb   = cost_matrix.loc[k, b]
-            gamma_val = fuel_fk / 245 + fuel_kb
+            gamma_val = fuel_fk / 245 + fuel_kb/245
             gamma_rows.append({
                 "f": supplier_label[f],
                 "b": hub_label[b],
