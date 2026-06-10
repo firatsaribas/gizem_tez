@@ -12,7 +12,7 @@ from docplex.mp.model import Model
 # =============================================================================
 # 1. INSTANCE DATA
 # =============================================================================
-
+"""
 producers = list(range(1, 11))
 levels = [0, 1, 2]
 G = list(range(len(producers)))
@@ -36,7 +36,86 @@ lon = {
 
 q = {1: 12, 2: 7, 3: 15, 4: 10, 5: 5, 6: 18, 7: 6, 8: 14, 9: 10, 10: 9}
 #q = {1: 12, 2: 7, 3: 11, 4: 8, 5: 5, 6: 13, 7: 6, 8: 9, 9: 10, 10: 9}
+"""
+# Sets
+producers = list(range(1, 16))
+levels = [0, 1, 2]
+G = list(range(len(producers)))
 
+# Producer locations
+district = {
+    1: "Kırkağaç, Manisa",
+    2: "Salihli, Manisa",
+    3: "Saruhanlı, Manisa",
+    4: "Şehzadeler, Manisa",
+    5: "Ahmetli, Manisa",
+    6: "Karacasu, Aydın",
+    7: "Bozdoğan, Aydın",
+    8: "Kuyucak, Aydın",
+    9: "Efeler, Aydın",
+    10: "Söke, Aydın",
+    11: "Sultanhisar, Aydın",
+    12: "Menemen, İzmir",
+    13: "Torbalı, İzmir",
+    14: "Ödemiş, İzmir",
+    15: "Bergama, İzmir",
+}
+
+# Coordinates
+lat = {
+    1: 39.099,
+    2: 38.480,
+    3: 38.741,
+    4: 38.619,
+    5: 38.520,
+    6: 37.728,
+    7: 37.671,
+    8: 37.913,
+    9: 37.848,
+    10: 37.748,
+    11: 37.888,
+    12: 38.598,
+    13: 38.156,
+    14: 38.228,
+    15: 39.121,
+}
+
+lon = {
+    1: 27.673,
+    2: 28.139,
+    3: 27.570,
+    4: 27.428,
+    5: 27.940,
+    6: 28.610,
+    7: 28.314,
+    8: 28.510,
+    9: 27.845,
+    10: 27.410,
+    11: 28.139,
+    12: 27.069,
+    13: 27.359,
+    14: 27.971,
+    15: 27.180,
+}
+
+# Calibrated quantities (Table 1)
+q = {
+    1: 23,
+    2: 23,
+    3: 14,
+    4: 6,
+    5: 4,
+    6: 21,
+    7: 17,
+    8: 17,
+    9: 10,
+    10: 6,
+    11: 6,
+    12: 9,
+    13: 5,
+    14: 4,
+    15: 3,
+}
 
 
 def haversine(la1, lo1, la2, lo2):
@@ -55,7 +134,7 @@ d = {
     for i in producers for j in producers if i != j
 }
 
-D_max = 75.0
+D_max = 65.0
 
 infeasible_pairs = [
     (i, j)
@@ -63,7 +142,7 @@ infeasible_pairs = [
     if i < j and d[(i, j)] > D_max
 ]
 
-
+"""
 # =============================================================================
 # 2. THRESHOLD-BASED REVENUE PARAMETERS
 # =============================================================================
@@ -78,6 +157,18 @@ p = {
     0: 130,
     1: 175,
     2: 220,
+}
+"""
+A = {
+    0: 0,    # Base (small lots)
+    1: 22,   # Medium-volume premium
+    2: 45,   # High-volume premium
+}
+
+p = {
+    0: 58000,   # TL/t
+    1: 62000,   # TL/t
+    2: 66300,   # TL/t
 }
 
 price_level = {
@@ -314,24 +405,32 @@ else:
 def write_results_to_excel(sol, filepath="threshold_model_results.xlsx"):
     import openpyxl
 
+    active_groups = [g for g in G if sol.get_value(y[g]) > 0.5]
+    # eski g -> yeni indeks eşlemesi (1'den başlar)
+    g_map = {g_old: g_new for g_new, g_old in enumerate(active_groups, start=1)}
+    new_G = list(range(1, len(active_groups) + 1))
+
     wb = openpyxl.Workbook()
 
+    # --- x_ig ---
     ws = wb.active
     ws.title = "x_ig"
     ws.cell(row=1, column=1, value="x_ig")
     ws.cell(row=2, column=1, value="i \\ g")
 
-    for g in G:
-        ws.cell(row=2, column=g + 2, value=g)
+    for col_idx, g_new in enumerate(new_G, start=2):
+        ws.cell(row=2, column=col_idx, value=g_new)
 
     for row_idx, i in enumerate(producers, start=3):
         ws.cell(row=row_idx, column=1, value=i)
-        for col_idx, g in enumerate(G, start=2):
-            ws.cell(row=row_idx, column=col_idx, value=round(sol.get_value(x[(i, g)])))
+        for col_idx, g_old in enumerate(active_groups, start=2):
+            ws.cell(row=row_idx, column=col_idx,
+                    value=round(sol.get_value(x[(i, g_old)])))
 
+    # --- s_i ---
     ws2 = wb.create_sheet("s_i")
-    ws2.append(["i", "district", "q_i", "s_i", "selected_level", "unit_price", "revenue"])
-
+    ws2.append(["i", "district", "q_i", "s_i", "selected_level",
+                "unit_price", "revenue"])
     for i in producers:
         if sol.get_value(s[i]) > 0.5:
             l = selected_individual_level(i, sol)
@@ -339,44 +438,95 @@ def write_results_to_excel(sol, filepath="threshold_model_results.xlsx"):
         else:
             ws2.append([i, district[i], q[i], 0, None, None, 0])
 
+    # --- y_g : yalnızca aktif gruplar (1..K) ---
     ws3 = wb.create_sheet("y_g")
-    ws3.append(["g", "y_g", "Q_g", "selected_level", "unit_price", "revenue", "members"])
+    ws3.append(["g", "y_g", "Q_g", "selected_level", "unit_price",
+                "revenue", "members"])
+    for g_old in active_groups:
+        g_new = g_map[g_old]
+        l = selected_group_level(g_old, sol)
+        members = [i for i in producers if sol.get_value(x[(i, g_old)]) > 0.5]
+        Q_val = sol.get_value(Q[g_old])
+        ws3.append([
+            g_new, 1, Q_val, l, p[l], p[l] * Q_val,
+            ", ".join(map(str, members))
+        ])
 
-    for g in G:
-        if sol.get_value(y[g]) > 0.5:
-            l = selected_group_level(g, sol)
-            members = [i for i in producers if sol.get_value(x[(i, g)]) > 0.5]
-            Q_val = sol.get_value(Q[g])
-            ws3.append([
-                g, 1, Q_val, l, p[l], p[l] * Q_val,
-                ", ".join(map(str, members))
-            ])
-        else:
-            ws3.append([g, 0, 0, None, None, 0, ""])
-
+    # --- zG_gl ---
     ws4 = wb.create_sheet("zG_gl")
     ws4.append(["g \\ l"] + levels)
+    for g_old in active_groups:
+        g_new = g_map[g_old]
+        ws4.append([g_new] + [round(sol.get_value(zG[(g_old, l)])) for l in levels])
 
-    for g in G:
-        ws4.append([g] + [round(sol.get_value(zG[(g, l)])) for l in levels])
-
+    # --- zI_il ---
     ws5 = wb.create_sheet("zI_il")
     ws5.append(["i \\ l"] + levels)
-
     for i in producers:
         ws5.append([i] + [round(sol.get_value(zI[(i, l)])) for l in levels])
 
+    # --- wG_gl ---
     ws6 = wb.create_sheet("wG_gl")
     ws6.append(["g \\ l"] + levels)
+    for g_old in active_groups:
+        g_new = g_map[g_old]
+        ws6.append([g_new] + [round(sol.get_value(wG[(g_old, l)]), 4) for l in levels])
 
-    for g in G:
-        ws6.append([g] + [round(sol.get_value(wG[(g, l)]), 4) for l in levels])
-
+    # --- price_levels ---
     ws7 = wb.create_sheet("price_levels")
-    ws7.append(["level", "price_level_description", "minimum_quantity_A_l", "unit_price_p_l"])
-
+    ws7.append(["level", "price_level_description",
+                "minimum_quantity_A_l", "unit_price_p_l"])
     for l in levels:
         ws7.append([l, price_level[l], A[l], p[l]])
+
+        # --- revenue_detail ---
+    ws8 = wb.create_sheet("revenue_detail")
+    ws8.append([
+        "type", "id", "district / members", "quantity",
+        "selected_level", "price_level_description",
+        "threshold_A_l", "unit_price_p_l", "revenue"
+    ])
+
+    individual_revenue = 0
+    group_revenue = 0
+
+    # Bireysel satıcılar
+    for i in producers:
+        if sol.get_value(s[i]) > 0.5:
+            l = selected_individual_level(i, sol)
+            rev_i = p[l] * q[i]
+            individual_revenue += rev_i
+            ws8.append([
+                "Individual", i, district[i], q[i],
+                l, price_level[l], A[l], p[l], rev_i
+            ])
+
+    # Gruplar (1..K, yeniden numaralandırılmış)
+    for g_old in active_groups:
+        g_new = g_map[g_old]
+        l = selected_group_level(g_old, sol)
+        members = [i for i in producers if sol.get_value(x[(i, g_old)]) > 0.5]
+        Q_val = sol.get_value(Q[g_old])
+        rev_g = p[l] * Q_val
+        group_revenue += rev_g
+        ws8.append([
+            "Group", g_new,
+            ", ".join(f"{i} ({district[i]})" for i in members),
+            Q_val, l, price_level[l], A[l], p[l], rev_g
+        ])
+
+    # Boş satır + özet
+    ws8.append([])
+    ws8.append(["SUMMARY"])
+    ws8.append(["Individual revenue", individual_revenue])
+    ws8.append(["Group revenue", group_revenue])
+    ws8.append(["Total revenue", individual_revenue + group_revenue])
+    ws8.append(["Objective value (solver)", sol.objective_value])
+    ws8.append(["Number of active groups", len(active_groups)])
+    ws8.append([
+        "Number of individual sellers",
+        sum(1 for i in producers if sol.get_value(s[i]) > 0.5)
+    ])
 
     wb.save(filepath)
     print(f"\nResults saved to: {filepath}")
