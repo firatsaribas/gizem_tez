@@ -317,6 +317,11 @@ for g in G:
             ctname=f"geo_i{i}_j{j}_g{g}"
         )
 
+for i in producers:
+    mdl.add_constraint(
+        s[i] == 1,
+        ctname=f"force_individual_i{i}"
+    )
 
 # =============================================================================
 # 6. SOLVE
@@ -402,7 +407,7 @@ else:
 # 8. EXPORT RESULTS TO EXCEL
 # =============================================================================
 
-def write_results_to_excel(sol, filepath="threshold_model_results.xlsx"):
+def write_results_to_excel(sol, filepath="threshold_model_results_scenario1.xlsx"):
     import openpyxl
 
     active_groups = [g for g in G if sol.get_value(y[g]) > 0.5]
