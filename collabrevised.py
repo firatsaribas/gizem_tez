@@ -316,13 +316,25 @@ for g in G:
             x[(i, g)] + x[(j, g)] <= 1,
             ctname=f"geo_i{i}_j{j}_g{g}"
         )
-
+"""
 for i in producers:
     mdl.add_constraint(
         s[i] == 1,
         ctname=f"force_individual_i{i}"
     )
+"""
+for i in producers:
+    mdl.add_constraint(
+        mdl.sum(x[(i, g)] for g in G) == 1,
+        ctname=f"assignment2_i{i}"
+    )
 
+ # Minimum group quantity requirement added
+for g in G:
+    mdl.add_constraint(
+        Q[g] >= 19 * y[g],
+        ctname=f"S2_Qmin_{g}"
+    )  
 # =============================================================================
 # 6. SOLVE
 # =============================================================================
@@ -407,7 +419,7 @@ else:
 # 8. EXPORT RESULTS TO EXCEL
 # =============================================================================
 
-def write_results_to_excel(sol, filepath="threshold_model_results_scenario1.xlsx"):
+def write_results_to_excel(sol, filepath="threshold_model_results_scenario2.xlsx"):
     import openpyxl
 
     active_groups = [g for g in G if sol.get_value(y[g]) > 0.5]
