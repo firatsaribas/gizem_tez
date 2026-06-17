@@ -227,12 +227,19 @@ wG = {
 # =============================================================================
 # 4. OBJECTIVE FUNCTION
 # =============================================================================
-
+"""
 mdl.maximize(
     mdl.sum(p[l] * wG[(g, l)] for g in G for l in levels)
     + mdl.sum(p[l] * q[i] * zI[(i, l)] for i in producers for l in levels)
 )
-
+"""
+#scenario 3: add fixed cost of collaboration (F) to the objective function
+F = 32000  # TL per active group
+mdl.maximize(
+    mdl.sum(p[l] * wG[(g, l)] for g in G for l in levels)
+    + mdl.sum(p[l] * q[i] * zI[(i, l)] for i in producers for l in levels)
+    - F * mdl.sum(y[g] for g in G)
+)
 
 # =============================================================================
 # 5. CONSTRAINTS
@@ -317,12 +324,14 @@ for g in G:
             ctname=f"geo_i{i}_j{j}_g{g}"
         )
 """
+#scenario 1 just add below constraints to force all producers to sell individually
 for i in producers:
     mdl.add_constraint(
         s[i] == 1,
         ctname=f"force_individual_i{i}"
     )
-"""
+
+#scenario 2 just add below constraints to force all producers to sell collaboratively
 for i in producers:
     mdl.add_constraint(
         mdl.sum(x[(i, g)] for g in G) == 1,
@@ -335,6 +344,8 @@ for g in G:
         Q[g] >= 19 * y[g],
         ctname=f"S2_Qmin_{g}"
     )  
+""" 
+   
 # =============================================================================
 # 6. SOLVE
 # =============================================================================
@@ -415,11 +426,11 @@ else:
     print(f"Total revenue     : ${sol.objective_value:,.2f}")
 
 
-# =============================================================================
+# ============================================================================
 # 8. EXPORT RESULTS TO EXCEL
 # =============================================================================
 
-def write_results_to_excel(sol, filepath="threshold_model_results_scenario2.xlsx"):
+def write_results_to_excel(sol, filepath="threshold_model_results_scenario3_F_32000.xlsx"):
     import openpyxl
 
     active_groups = [g for g in G if sol.get_value(y[g]) > 0.5]
