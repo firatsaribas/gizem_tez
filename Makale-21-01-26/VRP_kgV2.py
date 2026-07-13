@@ -17,7 +17,7 @@ import openpyxl
 warnings.filterwarnings("ignore")
 
 SOLVER = "cplex"
-PARAMS_FILE = "parameters_input.xlsx"  # <-- change path if needed
+PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_V10.xlsx")
 
 
 # =============================================================================
@@ -381,7 +381,7 @@ def solve_with_cplex():
 # =============================================================================
 
 def export_to_excel(status, obj, elapsed, X, Z, delta, W, B, P, Inv, Q, L, F, M_aux,
-                    rev_val, trav_val, serv_val, filename="VRP_results_kg2.xlsx"):
+                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_basecase.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
