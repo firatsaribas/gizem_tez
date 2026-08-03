@@ -159,6 +159,13 @@ O = list(range(nF + 1, nF + nO + 1))
 V = list(range(0, nF + nO + 1))
 HUB = 0
 
+originOf = {k: nF + k for k in K}
+# Vehicle-specific node sets:
+# each vehicle can use its own origin, all farmers, and the hub.
+V_k = {
+    k: [originOf[k]] + N + [HUB]
+    for k in K
+}
 rho = params["rho"]
 d = params["d"]
 q = params["q"]
@@ -167,7 +174,7 @@ alpha = params["alpha"]
 a0 = params["a0"]
 g = params["g"]
 
-originOf = {k: nF + k for k in K}
+
 
 # ── Coordinates ──────────────────────────────────────────────────────────────
 # If the Coordinates sheet was populated, use those values.
@@ -205,9 +212,14 @@ def dist_km(u, v):
     return math.sqrt(dlat**2 + dlon**2)
 
 cost_per_km = 12/100 * 1.29
-c = {(u, v, k): round(dist_km(u,v)*cost_per_km, 4)
-     for u in V for v in V for k in K}
-
+   
+c = {
+    (u, v, k): round(dist_km(u, v) * cost_per_km, 4)
+    for k in K
+    for u in V_k[k]
+    for v in V_k[k]
+    if u != v
+}
 def m_val(i, tau, t, s):
     return round(r_price[i] * (1 - d[s])**(t - tau), 6) #C29
 def ub_cohort_val(i, tau, t, s):
@@ -228,8 +240,14 @@ def solve_with_cplex():
     from docplex.mp.model import Model
     mdl = Model(name="Perishable_VRP_kg")
 
-    X = {(u,v,k,t): mdl.binary_var(name=f"X_{u}_{v}_{k}_{t}")
-         for u in V for v in V for k in K for t in T if u!=v}
+    X = {
+        (u, v, k, t): mdl.binary_var(name=f"X_{u}_{v}_{k}_{t}")
+        for k in K
+        for u in V_k[k]
+        for v in V_k[k]
+        for t in T
+        if u != v
+    }
     Z     = {(i,k,t): mdl.binary_var(name=f"Z_{i}_{k}_{t}") for i in N for k in K for t in T}
     delta = {(i,t): mdl.binary_var(name=f"delta_{i}_{t}") for i in N for t in T}
     W     = {(k,t): mdl.binary_var(name=f"W_{k}_{t}") for k in K for t in T}
@@ -239,11 +257,11 @@ def solve_with_cplex():
     Q   = {(i,t,s): mdl.continuous_var(lb=0) for i in N for t in T for s in S}
     L   = {(i,k,t,s): mdl.continuous_var(lb=0) for i in N for k in K for t in T for s in S}
     F   = {(u,v,k,t,s): mdl.continuous_var(lb=0)
-           for u in V for v in V for k in K for t in T for s in S if u!=v}
+           for k in K for u in V_k[k] for v in V_k[k] for t in T for s in S if u!=v}
     M_aux = {(i,k,t): mdl.continuous_var(lb=0) for i in N for k in K for t in T}
 
     revenue = mdl.sum(rho[s]*m[i,tau,t,s]*P[i,tau,t,s] for i in N for t in T for s in S for tau in T0 if tau<=t)
-    travel  = mdl.sum(c[u,v,k]*X[u,v,k,t] for u in V for v in V for k in K for t in T if u!=v)
+    travel  = mdl.sum(c[u,v,k]*X[u,v,k,t] for k in K for u in V_k[k] for v in V_k[k]  for t in T if u!=v)
     service = mdl.sum(alpha[i]*Z[i,k,t] for i in N for k in K for t in T)
     mdl.maximize(revenue - travel - service)
 
@@ -299,47 +317,50 @@ def solve_with_cplex():
                 for s in S:
                     mdl.add_constraint(L[i, k, t, s] <= q[k] * Z[i, k, t]) #C14
                     mdl.add_constraint(L[i, k, t, s] <= ub_total[i, t, s] * Z[i, k, t]) #C15
-    for u in V:
-        for v in V:
-            if u == v: continue
-            for k in K:
+    for k in K:
+        for u in V_k[k]:
+            for v in V_k[k]:
+                if u == v:
+                    continue
                 for t in T:
                     for s in S:
-                        mdl.add_constraint(F[u, v, k, t, s] <= q[k] * X[u, v, k, t]) #C16
+                        mdl.add_constraint(
+                            F[u, v, k, t, s]
+                            <= q[k] * X[u, v, k, t])  # C16
 
 
     for k in K:
         ok = originOf[k]
         for t in T:
             for s in S:
-                mdl.add_constraint(mdl.sum(F[ok,v,k,t,s] for v in V if v!=ok)==0) #C17
-                mdl.add_constraint(mdl.sum(F[u,ok,k,t,s] for u in V if u!=ok)==0)  #C18
-                mdl.add_constraint(mdl.sum(F[u,HUB,k,t,s] for u in V if u!=HUB)==mdl.sum(L[i,k,t,s] for i in N)) #C20
-                mdl.add_constraint(mdl.sum(F[HUB,v,k,t,s] for v in V if v!=HUB)==0) #C21
+                mdl.add_constraint(mdl.sum(F[ok,v,k,t,s] for v in V_k[k] if v!=ok)==0) #C17
+                mdl.add_constraint(mdl.sum(F[u,ok,k,t,s] for u in V_k[k] if u!=ok)==0)  #C18
+                mdl.add_constraint(mdl.sum(F[u,HUB,k,t,s] for u in V_k[k] if u!=HUB)==mdl.sum(L[i,k,t,s] for i in N)) #C20
+                mdl.add_constraint(mdl.sum(F[HUB,v,k,t,s] for v in V_k[k] if v!=HUB)==0) #C21
     for i in N:
         for k in K:
             for t in T:
                 for s in S:
-                    mdl.add_constraint(mdl.sum(F[i,v,k,t,s] for v in V if v!=i)-mdl.sum(F[u,i,k,t,s] for u in V if u!=i)==L[i,k,t,s]) #C19
+                    mdl.add_constraint(mdl.sum(F[i,v,k,t,s] for v in V_k[k] if v!=i)-mdl.sum(F[u,i,k,t,s] for u in V_k[k] if u!=i)==L[i,k,t,s]) #C19
     for k in K:
         ok = originOf[k]
         for t in T:
-            mdl.add_constraint(mdl.sum(X[ok,v,k,t] for v in V if v!=ok)==W[k,t]) #C22
-            mdl.add_constraint(mdl.sum(X[u,HUB,k,t] for u in V if u!=HUB)==W[k,t]) #C23
-            mdl.add_constraint(mdl.sum(X[u,ok,k,t] for u in V if u!=ok)==0) #C24
-            mdl.add_constraint(mdl.sum(X[HUB,v,k,t] for v in V if v!=HUB)==0) #C25
+            mdl.add_constraint(mdl.sum(X[ok,v,k,t] for v in V_k[k] if v!=ok)==W[k,t]) #C22
+            mdl.add_constraint(mdl.sum(X[u,HUB,k,t] for u in V_k[k] if u!=HUB)==W[k,t]) #C23
+            mdl.add_constraint(mdl.sum(X[u,ok,k,t] for u in V_k[k] if u!=ok)==0) #C24
+            mdl.add_constraint(mdl.sum(X[HUB,v,k,t] for v in V_k[k] if v!=HUB)==0) #C25
     for i in N:
         for k in K:
             for t in T:
-                mdl.add_constraint(mdl.sum(X[u,i,k,t] for u in V if u!=i)==Z[i,k,t])  #26
-                mdl.add_constraint(mdl.sum(X[i,v,k,t] for v in V if v!=i)==Z[i,k,t])  #27
+                mdl.add_constraint(mdl.sum(X[u,i,k,t] for u in V_k[k] if u!=i)==Z[i,k,t])  #26
+                mdl.add_constraint(mdl.sum(X[i,v,k,t] for v in V_k[k] if v!=i)==Z[i,k,t])  #27
     for i in N:
         for j in N:
             if i==j: continue
             for k in K:
                 for t in T:
                     mdl.add_constraint(M_aux[i,k,t]-M_aux[j,k,t]+nF*X[i,j,k,t]<=nF-1+nF*(2-Z[i,k,t]-Z[j,k,t]))  #28
-
+    '''
     for i in N:
         for t in T:
             for s in S:
@@ -350,7 +371,7 @@ def solve_with_cplex():
                         mdl.add_constraint(P[i, tau, t, s] <= ub)
                         mdl.add_constraint(Inv[i, tau, t, s] <= ub)
                         mdl.add_constraint(Q[i, t, s] <= ub_total[i, t, s])
-
+    '''
     t0 = time.time()
     sol = mdl.solve(log_output=True)
     elapsed = time.time() - t0
@@ -363,7 +384,7 @@ def solve_with_cplex():
                       for i in N for t in T for s in S
                       for tau in T0 if tau <= t)
         trav_val = sum(c[u, v, k] * X[u, v, k, t].solution_value
-                       for u in V for v in V for k in K for t in T if u != v)
+                       for k in K for u in V_k[k] for v in V_k[k] for t in T if u != v)
         serv_val = sum(alpha[i] * Z[i, k, t].solution_value
                        for i in N for k in K for t in T)
         rev_val = round(rev_val, 4)
@@ -381,7 +402,7 @@ def solve_with_cplex():
 # =============================================================================
 
 def export_to_excel(status, obj, elapsed, X, Z, delta, W, B, P, Inv, Q, L, F, M_aux,
-                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_basecase.xlsx"):
+                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_basecasevk.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
