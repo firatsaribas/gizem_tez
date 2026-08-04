@@ -117,7 +117,7 @@ q = {
     15: 3,
 }
 
-
+"""
 def haversine(la1, lo1, la2, lo2):
     R = 6371.0
     phi1, phi2 = math.radians(la1), math.radians(la2)
@@ -135,12 +135,14 @@ d = {
 }
 
 D_max = 65.0
+#D_max = 100.0
 
 infeasible_pairs = [
     (i, j)
     for i in producers for j in producers
     if i < j and d[(i, j)] > D_max
 ]
+"""
 
 """
 # =============================================================================
@@ -157,6 +159,12 @@ p = {
     0: 130,
     1: 175,
     2: 220,
+}
+
+A = {
+    0: 0,    # Base (small lots)
+    1: 22,   # Medium-volume premium
+    2: 45,   # High-volume premium
 }
 """
 A = {
@@ -227,7 +235,7 @@ wG = {
 # =============================================================================
 # 4. OBJECTIVE FUNCTION
 # =============================================================================
-"""
+
 mdl.maximize(
     mdl.sum(p[l] * wG[(g, l)] for g in G for l in levels)
     + mdl.sum(p[l] * q[i] * zI[(i, l)] for i in producers for l in levels)
@@ -240,7 +248,7 @@ mdl.maximize(
     + mdl.sum(p[l] * q[i] * zI[(i, l)] for i in producers for l in levels)
     - F * mdl.sum(y[g] for g in G)
 )
-
+"""
 # =============================================================================
 # 5. CONSTRAINTS
 # =============================================================================
@@ -317,13 +325,25 @@ for g in G:
             ctname=f"w_ge_Q_minus_M_g{g}_l{l}"
         )
 
+#scenario 2 just add below constraints to force all producers to sell collaboratively
+for i in producers:
+    mdl.add_constraint(
+        mdl.sum(x[(i, g)] for g in G) == 1,
+        ctname=f"assignment2_i{i}"
+    )
+
+
+"""
 for g in G:
     for i, j in infeasible_pairs:
         mdl.add_constraint(
             x[(i, g)] + x[(j, g)] <= 1,
             ctname=f"geo_i{i}_j{j}_g{g}"
         )
-"""
+
+
+
+
 #scenario 1 just add below constraints to force all producers to sell individually
 for i in producers:
     mdl.add_constraint(
@@ -430,7 +450,7 @@ else:
 # 8. EXPORT RESULTS TO EXCEL
 # =============================================================================
 
-def write_results_to_excel(sol, filepath="threshold_model_results_scenario3_F_32000.xlsx"):
+def write_results_to_excel(sol, filepath="threshold_model_results_scenario2_deneme.xlsx"):
     import openpyxl
 
     active_groups = [g for g in G if sol.get_value(y[g]) > 0.5]

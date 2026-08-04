@@ -1,0 +1,16 @@
+{
+    "python.defaultInterpreterPath": "/Users/academicgirl/miniforge3/envs/cplex_env/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.defaultProfile.osx": "zsh (cplex_env)",
+    "terminal.integrated.profiles.osx": {
+        "zsh (cplex_env)": {
+            "path": "zsh",
+            "args": ["-i"],
+            "env": {
+                "ZDOTDIR": "${workspaceFolder}/.vscode"
+            }
+        }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
+}
