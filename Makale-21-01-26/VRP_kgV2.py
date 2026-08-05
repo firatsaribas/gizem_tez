@@ -17,7 +17,8 @@ import openpyxl
 warnings.filterwarnings("ignore")
 
 SOLVER = "cplex"
-PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_V10.xlsx")
+#PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_V10.xlsx")
+PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_calibrated.xlsx")
 
 
 # =============================================================================
@@ -360,6 +361,9 @@ def solve_with_cplex():
             for k in K:
                 for t in T:
                     mdl.add_constraint(M_aux[i,k,t]-M_aux[j,k,t]+nF*X[i,j,k,t]<=nF-1+nF*(2-Z[i,k,t]-Z[j,k,t]))  #28
+
+
+
     '''
     for i in N:
         for t in T:
@@ -402,7 +406,7 @@ def solve_with_cplex():
 # =============================================================================
 
 def export_to_excel(status, obj, elapsed, X, Z, delta, W, B, P, Inv, Q, L, F, M_aux,
-                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_basecasevk.xlsx"):
+                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_scenarioprepare.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
