@@ -302,7 +302,7 @@ def solve_with_cplex():
                         ub = ub_cohort[i,tau,t,s]
                         mdl.add_constraint(P[i,tau,t,s] <= B[i,tau,t,s]) #C8
                         mdl.add_constraint(P[i,tau,t,s] <= ub*delta[i,t]) #C9
-                        #mdl.add_constraint(P[i,tau,t,s] >= B[i,tau,t,s]-ub*(1-delta[i,t])) #C10
+                        mdl.add_constraint(P[i,tau,t,s] >= B[i,tau,t,s]-ub*(1-delta[i,t])) #C10
                         mdl.add_constraint(Inv[i,tau,t,s]==B[i,tau,t,s]-P[i,tau,t,s]) #C11
 
     for i in N:
@@ -360,11 +360,11 @@ def solve_with_cplex():
             for k in K:
                 for t in T:
                     mdl.add_constraint(M_aux[i,k,t]-M_aux[j,k,t]+nF*X[i,j,k,t]<=nF-1+nF*(2-Z[i,k,t]-Z[j,k,t]))  #28
-    '''
+  
     for i in N:
         for t in T:
             mdl.add_constraint(mdl.sum(Z[i,k,t] for k in K) <= 1) #scenario1
-    '''
+  
 
     '''
     for i in N:
@@ -408,7 +408,7 @@ def solve_with_cplex():
 # =============================================================================
 
 def export_to_excel(status, obj, elapsed, X, Z, delta, W, B, P, Inv, Q, L, F, M_aux,
-                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_scenariofullpickup.xlsx"):
+                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_scenariononcollaboration.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
