@@ -5,6 +5,7 @@ PHASE I - CONSTRUCTIVE INITIAL SOLUTION
 Bu dosya yalnızca başlangıç çözümünü oluşturur.
 
 Akış:
+
 1. Excel'den problem verilerini oku.
 2. Mesafe ve seyahat maliyetlerini hesapla.
 3. Dönem dönem ziyaret programını oluştur.
