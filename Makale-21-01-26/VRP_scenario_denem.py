@@ -17,7 +17,7 @@ import openpyxl
 warnings.filterwarnings("ignore")
 
 SOLVER = "cplex"
-PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_calibrated.xlsx")
+PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_input_V13_07.08.2026.xlsx")
 
 
 # =============================================================================
@@ -302,7 +302,7 @@ def solve_with_cplex():
                         ub = ub_cohort[i,tau,t,s]
                         mdl.add_constraint(P[i,tau,t,s] <= B[i,tau,t,s]) #C8
                         mdl.add_constraint(P[i,tau,t,s] <= ub*delta[i,t]) #C9
-                        #mdl.add_constraint(P[i,tau,t,s] >= B[i,tau,t,s]-ub*(1-delta[i,t])) #C10
+                        mdl.add_constraint(P[i,tau,t,s] >= B[i,tau,t,s]-ub*(1-delta[i,t])) #C10 close this one for scenario 2
                         mdl.add_constraint(Inv[i,tau,t,s]==B[i,tau,t,s]-P[i,tau,t,s]) #C11
 
     for i in N:
@@ -360,13 +360,28 @@ def solve_with_cplex():
             for k in K:
                 for t in T:
                     mdl.add_constraint(M_aux[i,k,t]-M_aux[j,k,t]+nF*X[i,j,k,t]<=nF-1+nF*(2-Z[i,k,t]-Z[j,k,t]))  #28
-    '''
+
+    # ============================================================
+    # FRESHNESS-ORIENTED COLLECTION POLICY
+
+    A_MAX = 1   # Maximum allowable cohort age
+
+    for i in N:
+        for t in T:
+            for s in S:
+                for tau in T0:
+                    if tau <= t and (t - tau) >= A_MAX:
+                        mdl.add_constraint(
+                            Inv[i, tau, t, s] == 0,
+                            ctname=f"freshness_{i}_{tau}_{t}_{s}"
+                        )               
+    '''   
     for i in N:
         for t in T:
             mdl.add_constraint(mdl.sum(Z[i,k,t] for k in K) <= 1) #scenario1
   
 
-    
+ 
     for i in N:
         for t in T:
             for s in S:
@@ -408,7 +423,7 @@ def solve_with_cplex():
 # =============================================================================
 
 def export_to_excel(status, obj, elapsed, X, Z, delta, W, B, P, Inv, Q, L, F, M_aux,
-                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_scenario_partialpickup.xlsx"):
+                    rev_val, trav_val, serv_val, filename="VRP_results_kg_10farmers_scenario_freshnessoriented.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
