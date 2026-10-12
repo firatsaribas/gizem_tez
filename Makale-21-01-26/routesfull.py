@@ -8,11 +8,11 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # CONFIG — change only here
 # ============================================================
-NUM_DEPOTS = 40    # total number of depots
-NUM_HUBS   = 4     # total number of hubs
-TARGET     = 500  # total number of routes to generate
+NUM_DEPOTS = 70    # total number of depots
+NUM_HUBS   = 7     # total number of hubs
+TARGET     = 10000  # total number of routes to generate
 
-NOKTALAR_FILE = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\Noktalar150suppliers.csv"
+NOKTALAR_FILE = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\Noktalar300suppliers.csv"
 
 FUEL_PRICE_PER_LITRE = 1.29
 
@@ -196,7 +196,7 @@ for rid in range(1, TARGET + 1):
 # =========================
 rotalarr_lines = [",".join([f"Rota {rid}"] + all_route_points[rid])
                   for rid in range(1, TARGET + 1)]
-csv_out = f"rotalarr_{TARGET}_generated.csv"
+csv_out = f"rotalarr200FV16_{TARGET}_generated.csv"
 with open(csv_out, "w", encoding="utf-8-sig") as f:
     f.write("\n".join(rotalarr_lines))
 print(f"CSV yazıldı: {csv_out}")
@@ -471,7 +471,7 @@ ws4.column_dimensions["D"].width = 55
 # ----------------------------------------------------------
 # Save
 # ----------------------------------------------------------
-excel_out = f"routes_{TARGET}_full.xlsx"
+excel_out = f"300suppliersV25_routes_{TARGET}_full.xlsx"
 wb.save(excel_out)
 print(f"✅ Excel yazıldı: {excel_out}")
 print(df_analysis[["route_name", "distance_km", "route_cost_eur", "route_capacity"]].head())

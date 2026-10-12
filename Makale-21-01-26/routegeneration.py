@@ -3,11 +3,11 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-
+#'''
 # =========================
 # 0) INPUT: mevcut 30 rota
 # =========================
-'''
+
 route_to_am_30 = {
     1:2, 2:1, 3:1, 4:2, 5:3, 6:3, 7:2, 8:3, 9:2, 10:1,
     11:2, 12:3, 13:2, 14:1, 15:3, 16:2, 17:2, 18:2, 19:1, 20:3,
@@ -47,7 +47,7 @@ route_to_depots_30 = {
     30:[18,30,29]
 }
 
-ALL_DEPOTS = list(range(1, 31))
+ALL_DEPOTS = list(range(1, 41))
 
 # =========================
 # 1) yardımcı fonksiyonlar (rota üretimi)
@@ -113,9 +113,9 @@ def signature(hub, depots):
     return (hub, tuple(sorted(depots)))
 
 def expand_routes_to_target(route_to_am_30, route_to_depots_30,
-                             target=750, seed=42,
+                             target=500, seed=42,
                              min_len=3, max_len=6,
-                             n_mutate=275, n_random=300, n_merge=145):
+                             n_mutate=150, n_random=150, n_merge=80195):
 
     random.seed(seed)
 
@@ -145,7 +145,7 @@ def expand_routes_to_target(route_to_am_30, route_to_depots_30,
     for _ in range(n_random):
         if next_id > target:
             break
-        hub = random.choice([1,2,3])
+        hub = random.choice([1,2,3,4])
         depots = random_route(min_len, max_len)
         sig = signature(hub, depots)
         if sig in used:
@@ -156,14 +156,14 @@ def expand_routes_to_target(route_to_am_30, route_to_depots_30,
         next_id += 1
 
     # (C) merge (same hub)
-    by_hub = {1:[], 2:[], 3:[]}
+    by_hub = {1:[], 2:[], 3:[], 4:[]}
     for r in new_dep:
         by_hub[new_am[r]].append(r)
 
     for _ in range(n_merge):
         if next_id > target:
             break
-        hub = random.choice([1,2,3])
+        hub = random.choice([1,2,3,4])
         if len(by_hub[hub]) < 2:
             continue
         r1, r2 = random.sample(by_hub[hub], 2)
@@ -189,7 +189,7 @@ def expand_routes_to_target(route_to_am_30, route_to_depots_30,
             hub = new_am[r0]
             depots = mutate_route(new_dep[r0], hub, min_len, max_len)
         else:
-            hub = random.choice([1,2,3])
+            hub = random.choice([1,2,3,4])
             depots = random_route(min_len, max_len)
 
         sig = signature(hub, depots)
@@ -205,14 +205,14 @@ def expand_routes_to_target(route_to_am_30, route_to_depots_30,
 # =========================
 # 2) 500 rota üret
 # =========================
-route_to_am_750, route_to_depots_750 = expand_routes_to_target(
+route_to_am_500, route_to_depots_500 = expand_routes_to_target(
     route_to_am_30, route_to_depots_30,
-    target=750, seed=42,
+    target=500, seed=42,
     min_len=3, max_len=6,
-    n_mutate=275, n_random=300, n_merge=145
+    n_mutate=150, n_random=150, n_merge=80
 )
 
-print(f"Toplam üretilen rota sayısı: {len(route_to_depots_750)}")
+print(f"Toplam üretilen rota sayısı: {len(route_to_depots_500)}")
 
 # =========================
 # 3) rotalarr.csv formatına çevir
@@ -226,18 +226,18 @@ def build_route_points(hub_id: int, depots: list) -> list:
     return pts
 
 rotalarr_lines = []
-for rid in range(1, 751):
-    hub_id = route_to_am_750[rid]
-    depots = route_to_depots_750[rid]
+for rid in range(1, 501):
+    hub_id = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
     points = build_route_points(hub_id, depots)
     line = ",".join([f"Rota {rid}"] + points)
     rotalarr_lines.append(line)
 
-rotalarr_out = "rotalarr_750_generated.csv"
+rotalarr_out = "rotalarr_500_generatedwith40depots.csv"
 with open(rotalarr_out, "w", encoding="utf-8-sig") as f:
     f.write("\n".join(rotalarr_lines))
 
-print("CSV yazıldı: rotalarr_750_generated.csv")
+print("CSV yazıldı: rotalarr_500_generatedwith40depots.csv")
 
 
 # =========================
@@ -295,7 +295,7 @@ ws1.freeze_panes = "A3"
 ws1.row_dimensions[1].height = 30
 ws1.row_dimensions[2].height = 20
 
-add_title_banner(ws1, "750 Route Dataset — Raw Data", "A1:I1")
+add_title_banner(ws1, "500 Route Dataset — Raw Data", "A1:I1")
 
 headers1 = ["Route No", "Starting Hub", "No. of Depots",
             "Depot 1", "Depot 2", "Depot 3", "Depot 4", "Depot 5", "Depot 6"]
@@ -303,11 +303,11 @@ for col, h in enumerate(headers1, 1):
     ws1.cell(row=2, column=col, value=h)
 style_header_row(ws1, 2, len(headers1), fill=SUBHEAD_FILL)
 
-for i, rid in enumerate(range(1, 751)):
+for i, rid in enumerate(range(1, 501)):
     row = i + 3
     alt = (i % 2 == 1)
-    hub    = route_to_am_750[rid]
-    depots = route_to_depots_750[rid]
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
 
     style_data_cell(ws1, row, 1, rid,        alt, bold=True)
     hub_cell = style_data_cell(ws1, row, 2, hub, alt)
@@ -336,11 +336,11 @@ for col, h in enumerate(["Route No", "route_no: hub", "route_no: [depots]"], 1):
     ws2.cell(row=2, column=col, value=h)
 style_header_row(ws2, 2, 3, fill=SUBHEAD_FILL)
 
-for i, rid in enumerate(range(1, 751)):
+for i, rid in enumerate(range(1, 501)):
     row = i + 3
     alt    = (i % 2 == 1)
-    hub    = route_to_am_750[rid]
-    depots = route_to_depots_750[rid]
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
     style_data_cell(ws2, row, 1, rid,                    alt, bold=True)
     style_data_cell(ws2, row, 2, f"{rid}: {hub}",        alt, align="left")
     style_data_cell(ws2, row, 3, f"{rid}: {depots}",     alt, align="left")
@@ -363,11 +363,11 @@ for col, h in enumerate(["Route No", "<route_no, hub, {depots}>"], 1):
     ws3.cell(row=2, column=col, value=h)
 style_header_row(ws3, 2, 2, fill=SUBHEAD_FILL)
 
-for i, rid in enumerate(range(1, 751)):
+for i, rid in enumerate(range(1, 501)):
     row = i + 3
     alt    = (i % 2 == 1)
-    hub    = route_to_am_750[rid]
-    depots = route_to_depots_750[rid]
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
     depot_set = "{" + ",".join(str(d) for d in depots) + "}"
     opl_str   = f"<{rid},{hub},{depot_set}>"
     style_data_cell(ws3, row, 1, rid,     alt, bold=True)
@@ -391,11 +391,11 @@ for col, h in enumerate(["Route No", "route_no: hub",
     ws4.cell(row=2, column=col, value=h)
 style_header_row(ws4, 2, 4, fill=SUBHEAD_FILL)
 
-for i, rid in enumerate(range(1, 751)):
+for i, rid in enumerate(range(1, 501)):
     row = i + 3
     alt    = (i % 2 == 1)
-    hub    = route_to_am_750[rid]
-    depots = route_to_depots_750[rid]
+    hub    = route_to_am_500[rid]
+    depots = route_to_depots_500[rid]
     depot_set = "{" + ",".join(str(d) for d in depots) + "}"
     opl_str   = f"<{rid},{hub},{depot_set}>"
     style_data_cell(ws4, row, 1, rid,                alt, bold=True)
@@ -411,13 +411,13 @@ ws4.column_dimensions["D"].width = 55
 # ----------------------------------------------------------
 # Kaydet
 # ----------------------------------------------------------
-excel_out = "routes_750.xlsx"
+excel_out = "routes_500with40depots.xlsx"
 wb.save(excel_out)
 print(f"Excel yazıldı: {excel_out}")
-'''
+#'''
 
 
-#r'''
+r'''
 # =========================
 # 3) Noktalar.csv oku (birebir) + geodesic
 # =========================
@@ -426,8 +426,8 @@ import pandas as pd
 import os
 
 # ---- DOSYA YOLLARI ----
-noktalar_file = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\Noktalar.csv"
-rotalar_file  = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\rotalarr750.csv"
+noktalar_file = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\Noktalar150suppliers.csv"
+rotalar_file  = r"C:\Users\gizem\OneDrive\Belgeler\GitHub\gizem_tez\Makale-21-01-26\rotalarr500with40depots.csv"
 
 def clean_name(x):
     return str(x).replace("\u00a0", " ").strip()
@@ -541,11 +541,11 @@ df_out = pd.DataFrame(rows_out)
 # =========================
 # 5) ÇIKTI
 # =========================
-output_excel = "routes_analysis_results750.xlsx"
+output_excel = "routes_analysis_results500with40depot.xlsx"
 with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
     df_out.to_excel(writer, sheet_name="Analiz Sonuclari", index=False)
     df_rotalar.to_excel(writer, sheet_name="Okunan Rotalar", index=False)
 
 print(f"✅ Analiz tamamlandı ve '{output_excel}' dosyasına kaydedildi.")
 print(df_out[["route_name", "distance_km", "route_cost_eur"]].head())
-#'''
+'''

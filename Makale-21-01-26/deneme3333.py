@@ -257,22 +257,22 @@ def build_pyomo_model(inst: Instance, r_to_d: Dict[str, List[str]], r_to_h: Dict
     model.c_one_hub = pyo.Constraint(model.F, model.K, model.S, model.T, rule=c_one_hub_rule)
 
 
-    # (5) Merkez Akış Dengesi: Gelen miktar = Giden miktar
-    def c_hub_balance_rule(model, b, s, t):
-        # Sol Taraf (LHS): Tedarikçilerden merkeze (b) gelen toplam yük
-        # sum_{k in K} sum_{f in F} L[f,b,k,s,t]
-        total_inflow = sum(model.L[f, b, k, s, t] for k in model.K for f in model.F)
-        
-        # Sağ Taraf (RHS): Merkezden (b) depolara (D) giden toplam yük
-        # sum_{i in D} Q[b,i,t]
-        total_outflow = sum(model.Q[b, i, t] for i in model.D)
-        
-        # Kural: Giriş ve çıkış birbirine eşit olmalı
-        return total_inflow == total_outflow
+# (5) Merkez Akış Dengesi: Gelen miktar = Giden miktar
+def c_hub_balance_rule(model, b, s, t):
+    # Sol Taraf (LHS): Tedarikçilerden merkeze (b) gelen toplam yük
+    # sum_{k in K} sum_{f in F} L[f,b,k,s,t]
+    total_inflow = sum(model.L[f, b, k, s, t] for k in model.K for f in model.F)
+    
+    # Sağ Taraf (RHS): Merkezden (b) depolara (D) giden toplam yük
+    # sum_{i in D} Q[b,i,t]
+    total_outflow = sum(model.Q[b, i, t] for i in model.D)
+    
+    # Kural: Giriş ve çıkış birbirine eşit olmalı
+    return total_inflow == total_outflow
 
-    # Kısıtı modele ekliyoruz
-    # İndisler: b (Merkez), s (Senaryo), t (Zaman)
-    model.c_hub_balance = pyo.Constraint(model.B, model.S, model.T, rule=c_hub_balance_rule)
+# Kısıtı modele ekliyoruz
+# İndisler: b (Merkez), s (Senaryo), t (Zaman)
+model.c_hub_balance = pyo.Constraint(model.B, model.S, model.T, rule=c_hub_balance_rule)
 
 
     # (6) Inventory balance (2.11) - using the same cumulative form as CPLEX for exact match

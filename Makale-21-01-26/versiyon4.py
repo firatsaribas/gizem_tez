@@ -83,11 +83,10 @@ class Route:
     hub: str 
     depots: Tuple[str, ...] 
     capacity: float 
-    fixed_cost: float 
+    fixed_cost: float
 
 
 @dataclass 
-
 class Instance: 
     T: List[int] 
     D: List[str] 
@@ -1143,7 +1142,8 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
 
             OUT = {b: sum(int(sol.Q.get((b, i, t), 0)) for i in inst.D) for b in inst.B} 
 
-  
+            # ✅ 1) OUT (before) burada yazdır
+            print("t=", t, "OUT (before)=", OUT)
 
             # scenario-wise achievable amounts 
 
@@ -1162,6 +1162,9 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
             # robust target per hub: min across scenarios 
 
             OUT_target = {b: min(achieved_s[(b, s)] for s in inst.S) for b in inst.B} 
+
+            # ✅ 2) OUT_target burada yazdır
+            print("t=", t, "OUT_target (after robust min)=", OUT_target)
 
   
 

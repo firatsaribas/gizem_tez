@@ -15,19 +15,19 @@ from openpyxl.utils import get_column_letter
 # ════════════════════════════════════════════════════════════════
 #  CONFIG  — change these values as needed
 # ════════════════════════════════════════════════════════════════
-NUM_SUPPLIERS = 150   # F  (any positive integer)
-NUM_DEPOTS    = 40    # D  (must be divisible by 5)
+NUM_SUPPLIERS = 300   # F  (any positive integer)
+NUM_DEPOTS    = 70    # D  (must be divisible by 5)
 NUM_PERIODS   = 6     # T
 SEED          = 42
 SCALE_FACTOR  = 1.0   # multiply base demands by this factor
-OUTPUT_FILE   = "vrp_instance.xlsx"
+OUTPUT_FILE   = "vrp_instance300supply.xlsx"
 
 # ════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ════════════════════════════════════════════════════════════════
 VEHICLE_CAPACITY = 245
 NUM_SCENARIOS    = 3
-SCENARIO_RANGES  = {1: (30, 40), 2: (60, 70), 3: (120, 130)}
+SCENARIO_RANGES  = {1: (20, 30), 2: (60, 70), 3: (120, 130)}
 SCENARIO_PROBS   = [0.3, 0.5, 0.2]
 
 PATTERN_NAMES = ["decreasing", "increasing", "stationary", "cyclic", "seasonal"]

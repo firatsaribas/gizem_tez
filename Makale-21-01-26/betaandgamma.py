@@ -2,7 +2,7 @@ import pandas as pd
 from geopy.distance import geodesic
 
 # ── Load Data ──────────────────────────────────────────────────────────────────
-csv_file = "150suppliers.csv"
+csv_file = "300suppliers.csv"
 df_suppliers = pd.read_csv(csv_file)
 
 num_suppliers = len(df_suppliers)
@@ -14,9 +14,8 @@ hub_names      = [n for n in names if str(n).startswith("BB")]
 
 # Suppliers WITH vehicle (k index) — update this list as needed
 vehicle_supplier_numbers = [
-    2, 13, 32, 33, 37, 39, 46, 48, 58, 62, 65, 67,
-    77, 82, 87, 89, 97, 98, 105, 106, 107,
-    110, 112, 119, 122, 127, 135, 139, 140, 143
+    229,83,52,110,261,206,174,282,27,200,3,47,75,142,205,181,203,208,103,116,233,207,295,134,71
+
 ]
 # Map numbers to zero-padded supplier names (e.g. 2 → "T002", 13 → "T013")
 vehicle_supplier_names = [f"T{n:03d}" for n in vehicle_supplier_numbers]
@@ -41,7 +40,7 @@ for i in range(num_suppliers):
         else:
             distance_matrix.iloc[i, j] = 0
 
-distance_matrix.to_excel("150suppliersdistance.xlsx")
+distance_matrix.to_excel("250suppliersdistance.xlsx")
 print("Distance matrix saved.")
 
 # ── Fuel Cost Constants ────────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ for i in range(num_suppliers):
         else:
             cost_matrix.iloc[i, j] = 0
 
-cost_matrix.to_excel("noktalar_arasi_yakit_maliyetleri150suppliers.xlsx")
+cost_matrix.to_excel("noktalar_arasi_yakit_maliyetleri300suppliers.xlsx")
 print("Fuel cost matrix saved.")
 
 # ── Beta Matrix ────────────────────────────────────────────────────────────────
@@ -107,7 +106,7 @@ for f in supplier_names:
 gamma_df = pd.DataFrame(gamma_rows)
 
 # ── Write All Sheets to One Workbook ──────────────────────────────────────────
-output_combined = "150suppliers_all_matrices.xlsx"
+output_combined = "300suppliers25vehicle_all_matrices.xlsx"
 
 with pd.ExcelWriter(output_combined, engine="openpyxl") as writer:
     distance_matrix.to_excel(writer, sheet_name="distance")

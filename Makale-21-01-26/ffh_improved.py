@@ -130,6 +130,7 @@ class FFHSolution:
     Y: Dict[Tuple[str, str, str, str, int], int] = field(default_factory=dict)
     L: Dict[Tuple[str, str, str, str, int], int] = field(default_factory=dict)
     Ipos: Dict[Tuple[str, int], int] = field(default_factory=dict)
+    I:    Dict[Tuple[str, int], int] = field(default_factory=dict)  # signed inventory (can be ≤ 0)
     W: Dict[Tuple[str, int], int] = field(default_factory=dict)
     Q_cum: Dict[Tuple[str, int], int] = field(default_factory=dict)
     W_cum: Dict[Tuple[str, int], int] = field(default_factory=dict)
@@ -317,8 +318,8 @@ def _best_vehicle_for_pair(
     supply_available: int,
     inst: Instance,
     cap_left: Dict[str, int],
-    vehicle_hub: Dict[str, Optional[str]],
     activated_fk: set = None,
+    fk_hub: Dict = None,
 ) -> Optional[Tuple[float, str, int, float]]:
     """
     Two-tier vehicle selection targeting MILP cost structure (AC:TC ~ 12:1).
@@ -333,9 +334,6 @@ def _best_vehicle_for_pair(
       then gamma*ship as tiebreaker.
       Regret = unit_cost_2nd - unit_cost_best.
     """
-    if activated_fk is None:
-        activated_fk = set()
-
     max_to_ship = min(supply_available, remaining_hub)
     if max_to_ship <= 0:
         return None
@@ -343,10 +341,16 @@ def _best_vehicle_for_pair(
     reuse: List[Tuple[float, str, int]] = []        # (var_cost, k, ship)
     new:   List[Tuple[float, float, str, int]] = []  # (beta, var_cost, k, ship)
 
+    if activated_fk is None:
+        activated_fk = set()
+    if fk_hub is None:
+        fk_hub = {}
+
     for k in inst.K:
         if cap_left[k] <= 0:
             continue
-        if vehicle_hub[k] is not None and vehicle_hub[k] != b:
+        # OPL constraint 4: (f,k) already committed to a different hub
+        if fk_hub.get((f, k)) not in (None, b):
             continue
         if (f, k) not in inst.beta or (f, b, k) not in inst.gamma:
             continue
@@ -423,16 +427,16 @@ def inbound_assign_greedy_one_scenario_int(
 
     # ── initialise ───────────────────────────────────────────────────────────
     cap_left: Dict[str, int]              = {k: int_floor(inst.theta[k]) for k in inst.K}
-    vehicle_hub: Dict[str, Optional[str]] = {k: None for k in inst.K}
     activated_fk: set = set()  # built up within this scenario only
 
     Y_s: Dict[Tuple[str, str, str, str, int], int] = {}
     L_s: Dict[Tuple[str, str, str, str, int], int] = {}
     achieved: Dict[str, int] = {b: 0 for b in inst.B}
-    # OPL constraint 4: Σ_b Y[f,b,k,s,t] ≤ 1  — supplier f can serve at most
-    # one (b,k) combination per scenario-period. Track which hub each f is
-    # committed to; block any attempt to commit f to a second hub.
-    supplier_hub: Dict[str, str] = {}   # f -> b (first hub committed)
+    # OPL constraint 4: Σ_b Y[f,b,k,s,t] ≤ 1  per (f,k,s,t)
+    # Correct interpretation: a specific (f,k) pair may serve only ONE hub,
+    # but supplier f may use DIFFERENT vehicles (k1, k2, …) to serve
+    # DIFFERENT hubs simultaneously. Only the (f,k) pair is constrained.
+    fk_hub: Dict[Tuple[str,str], str] = {}   # (f,k) -> b already committed
 
     # FIX-B: keep supply as float — constraint (1) uses continuous L >= 0.
     # Integer floor silently discards supply; only round when writing final L.
@@ -451,8 +455,7 @@ def inbound_assign_greedy_one_scenario_int(
         Y_s[key] = 1
         L_s[key]        = L_s.get(key, 0) + ship_int
         cap_left[k]    -= ship_int
-        vehicle_hub[k]  = b
-        supplier_hub[f] = b   # lock supplier f to hub b
+        fk_hub[(f, k)] = b   # lock this (f,k) pair to hub b
         activated_fk.add((f, k))
         supply_left[f] -= ship_int
         achieved[b]    += ship_int
@@ -460,57 +463,62 @@ def inbound_assign_greedy_one_scenario_int(
         if hub_needs[b] <= 0:
             hub_needs.pop(b, None)
 
-    # ── PASS 1: consolidation — cover each hub in a single activation ────────
+    # ── PASS 1: fill each hub greedily until need is met ────────────────────
+    # Process hubs largest-first. For each hub, loop until need==0 or no
+    # feasible supplier remains. At each step:
+    #   TIER-1: reuse an already-activated (f,k) — zero marginal beta.
+    #           Score: coverage DESC, var_cost ASC.
+    #   TIER-2: new activation. Score by amortised total cost per unit:
+    #           (beta[f,k] + gamma[f,b,k]*ship) / ship
+    #           This accounts for the fixed charge amortised over actual
+    #           shipment size, preferring suppliers that can cover more of
+    #           the remaining need in one activation.
     for b in sorted(list(hub_needs.keys()), key=lambda b: hub_needs[b], reverse=True):
-        if b not in hub_needs:
-            continue
-        need = hub_needs[b]
-        # TIER-1 reuse: already-active (f,k), score = (coverage DESC, var_cost ASC)
-        # TIER-2 new:   new activation,        score = (neg_beta DESC, coverage DESC, neg_var ASC)
-        # Always pick any tier-1 over any tier-2.
-        best_free: Optional[Tuple[float, float, str, str, int]] = None
-        best_new:  Optional[Tuple[float, float, float, str, str, int]] = None
+        # Inner loop: keep filling this hub until fully covered or supply exhausted
+        while b in hub_needs:
+            need = hub_needs[b]
+            best_free: Optional[Tuple[float, float, str, str, int]] = None
+            best_new:  Optional[Tuple[float, float, str, str, int]] = None
 
-        for f in inst.F:
-            if supply_left[f] <= 0:
-                continue
-            if (f, b) not in inst.allowed_f_b:
-                continue
-            # OPL constraint 4: supplier f already committed to a different hub
-            if supplier_hub.get(f) is not None and supplier_hub[f] != b:
-                continue
-            for k in inst.K:
-                if cap_left[k] <= 0:
+            for f in inst.F:
+                if supply_left[f] <= 0:
                     continue
-                if vehicle_hub[k] is not None and vehicle_hub[k] != b:
+                if (f, b) not in inst.allowed_f_b:
                     continue
-                if (f, k) not in inst.beta or (f, b, k) not in inst.gamma:
-                    continue
-                ship = min(supply_left[f], cap_left[k], need)
-                if ship <= 0:
-                    continue
-                var_cost = inst.gamma[(f, b, k)] * ship
-                coverage = ship / need
-                if (f, k) in activated_fk:
-                    score = (coverage, -var_cost)
-                    if best_free is None or score > (best_free[0], best_free[1]):
-                        best_free = (coverage, -var_cost, f, k, ship)
-                else:
-                    score = (-inst.beta[(f, k)], coverage, -var_cost)
-                    if best_new is None or score > (best_new[0], best_new[1], best_new[2]):
-                        best_new = (-inst.beta[(f, k)], coverage, -var_cost, f, k, ship)
+                for k in inst.K:
+                    if cap_left[k] <= 0:
+                        continue
+                    if fk_hub.get((f, k)) not in (None, b):
+                        continue
+                    if (f, k) not in inst.beta or (f, b, k) not in inst.gamma:
+                        continue
+                    ship = min(supply_left[f], cap_left[k], need)
+                    if ship <= 0:
+                        continue
+                    var_cost = inst.gamma[(f, b, k)] * ship
+                    coverage = ship / need
+                    if (f, k) in activated_fk:
+                        # Tier-1: already paid beta — score by coverage then var_cost
+                        score = (coverage, -var_cost)
+                        if best_free is None or score > (best_free[0], best_free[1]):
+                            best_free = (coverage, -var_cost, f, k, ship)
+                    else:
+                        # Tier-2: amortised total cost per unit delivered
+                        amortised = (inst.beta[(f, k)] + var_cost) / max(1, ship)
+                        score = (-amortised, coverage)
+                        if best_new is None or score > (best_new[0], best_new[1]):
+                            best_new = (-amortised, coverage, f, k, ship)
 
-        if best_free is not None:
-            f, k, ship = best_free[2], best_free[3], best_free[4]
-        elif best_new is not None:
-            f, k, ship = best_new[3], best_new[4], best_new[5]
-        else:
-            f = k = ship = None
+            if best_free is not None:
+                f, k, ship = best_free[2], best_free[3], best_free[4]
+            elif best_new is not None:
+                f, k, ship = best_new[2], best_new[3], best_new[4]
+            else:
+                break  # no feasible supplier — leave residual for Pass 2
 
-        if f is not None:
             commit(f, b, k, ship)
             if DEBUG_MODE:
-                print(f"  [P2-P1] t={t} s={s} CONSOLIDATE f={f}->b={b} k={k} ship={ship}")
+                print(f"  [P2-P1] t={t} s={s} FILL b={b} f={f} k={k} ship={ship} rem={hub_needs.get(b,0)}")
 
     # ── PASS 2: residual Vogel for any unmet hub needs ───────────────────────
     while hub_needs:
@@ -522,12 +530,10 @@ def inbound_assign_greedy_one_scenario_int(
                     continue
                 if (f, b) not in inst.allowed_f_b:
                     continue
-                # OPL constraint 4: supplier f already committed to a different hub
-                if supplier_hub.get(f) is not None and supplier_hub[f] != b:
-                    continue
+                # OPL constraint 4: filter handled inside _best_vehicle_for_pair via fk_hub
                 result = _best_vehicle_for_pair(
-                    f, b, remaining, supply_left[f], inst, cap_left, vehicle_hub,
-                    activated_fk
+                    f, b, remaining, supply_left[f], inst, cap_left,
+                    activated_fk, fk_hub
                 )
                 if result is None:
                     continue
@@ -549,6 +555,50 @@ def inbound_assign_greedy_one_scenario_int(
 # ============================================================
 # Phase 1: greedy route selection and loading
 # ============================================================
+def _load_routes(
+    selected: List[str],
+    r_deps: Dict, r_cap: Dict, r_hub: Dict,
+    qmin: Dict[str, float],
+    t: int,
+) -> Tuple[Dict, Dict, Dict]:
+    """Load a fixed set of selected routes and induce Q from Z."""
+    Z_t: Dict[Tuple[str, str, int], int] = {}
+    Q_t: Dict[Tuple[str, str, int], int] = {}
+    rem = {i: float(qmin.get(i, 0.0)) for i in qmin}
+
+    for r_id in selected:
+        cap  = r_cap[r_id]
+        deps = sorted(
+            (i for i in r_deps[r_id] if rem.get(i, 0.0) > 1e-9),
+            key=lambda i: rem[i], reverse=True
+        )
+        for i in deps:
+            if cap <= 0:
+                break
+            x_int = int_floor(min(rem[i], cap))
+            if x_int > 0:
+                Z_t[(i, r_id, t)] = Z_t.get((i, r_id, t), 0) + x_int
+                rem[i] -= x_int
+                cap    -= x_int
+
+    for (i, r_id, tt), z in Z_t.items():
+        b = r_hub[r_id]
+        Q_t[(b, i, tt)] = Q_t.get((b, i, tt), 0) + int(z)
+    Q_t = {k: v for k, v in Q_t.items() if v > 0}
+    return Z_t, Q_t
+
+
+def _route_cost(selected: List[str], r_cost: Dict) -> float:
+    return sum(r_cost[r] for r in selected)
+
+
+def _covers_all(selected: List[str], U: set, r_deps: Dict) -> bool:
+    covered = set()
+    for r in selected:
+        covered |= r_deps[r]
+    return U.issubset(covered)
+
+
 def greedy_route_selection_and_loading_int(
     inst: Instance,
     t: int,
@@ -561,27 +611,22 @@ def greedy_route_selection_and_loading_int(
     U = {i for i, v in qmin.items() if v > 1e-9}
 
     X_t: Dict[Tuple[str, int], int] = {}
-    Z_t: Dict[Tuple[str, str, int], int] = {}
-    Q_t: Dict[Tuple[str, str, int], int] = {}   # built from Z only
 
     r_deps = {r.r_id: set(r.depots) for r in inst.routes}
     r_cost = {r.r_id: r.fixed_cost for r in inst.routes}
     r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes}
     r_hub  = {r.r_id: r.hub for r in inst.routes}
 
-    # Greedy set-cover: select routes to minimise total fixed cost while
-    # covering all depots with qmin > 0.
-    # Score = (total qmin demand covered by this route) / (route fixed cost λ_r)
-    # This is the standard weighted set-cover ratio heuristic.
-    # It selects routes that deliver the most required product per euro of
-    # fixed cost, naturally preferring routes that bundle many depots.
-    # Utilisation penalties are NOT applied — they would cause the heuristic
-    # to skip delivering to low-demand depots, violating constraint (19).
+    # ── Step 1: weighted set-cover greedy ────────────────────────────────────
+    # Score = Σ qmin[i over uncovered depots] / λ[r]
+    # Standard ratio heuristic; no utilisation penalty (would skip mandatory
+    # deliveries to low-demand depots, violating service-level constraint).
     selected: List[str] = []
-    while U:
+    remaining_U = set(U)
+    while remaining_U:
         best_r, best_score = None, -1.0
         for r in inst.routes:
-            cover     = r_deps[r.r_id] & U
+            cover     = r_deps[r.r_id] & remaining_U
             cover_sum = sum(qmin[i] for i in cover)
             if cover_sum <= 1e-12:
                 continue
@@ -592,34 +637,50 @@ def greedy_route_selection_and_loading_int(
         if best_r is None:
             break
         selected.append(best_r)
-        X_t[(best_r, t)] = 1
-        U -= r_deps[best_r]
+        remaining_U -= r_deps[best_r]
 
-    # Load routes (int quantities)
-    rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+    # ── Step 2: drop redundant routes ────────────────────────────────────────
+    # A route r is redundant if all its mandatory depots are covered by the
+    # remaining routes. Removing it saves λ[r] at no feasibility cost.
+    # Process cheapest routes last (try to drop expensive ones first).
+    improved = True
+    while improved:
+        improved = False
+        for r in sorted(selected, key=lambda r: r_cost[r], reverse=True):
+            without = [x for x in selected if x != r]
+            if _covers_all(without, U, r_deps):
+                selected = without
+                improved = True
+                break   # restart after each drop
+
+    # ── Step 3: swap local search ─────────────────────────────────────────────
+    # Try replacing each selected route r with each unselected route r2.
+    # Accept if: (a) all mandatory depots still covered, and (b) cost improves.
+    # One pass over all selected routes; repeat until no improvement found.
+    all_route_ids = [r.r_id for r in inst.routes]
+    improved = True
+    while improved:
+        improved = False
+        for r in list(selected):
+            without = [x for x in selected if x != r]
+            candidates = [r2 for r2 in all_route_ids if r2 not in selected]
+            for r2 in candidates:
+                trial = without + [r2]
+                if _covers_all(trial, U, r_deps):
+                    saving = r_cost[r] - r_cost[r2]
+                    if saving > 1e-9:
+                        selected = trial
+                        improved = True
+                        break   # restart inner loop after swap
+            if improved:
+                break   # restart outer loop after swap
+
+    # ── Finalise X ───────────────────────────────────────────────────────────
     for r_id in selected:
-        cap  = r_cap[r_id]
-        deps = sorted(
-            (i for i in r_deps[r_id] if rem[i] > 1e-9),
-            key=lambda i: rem[i], reverse=True
-        )
-        for i in deps:
-            if cap <= 0:
-                break
-            x_int = int_floor(min(rem[i], cap))
-            if x_int > 0:
-                Z_t[(i, r_id, t)] = Z_t.get((i, r_id, t), 0) + x_int
-                rem[i] -= x_int
-                cap    -= x_int
+        X_t[(r_id, t)] = 1
 
-    # Induce Q from Z — only set Q[b,i,t] if Z actually delivers to (b,i)
-    # This guarantees constraint (13): Σ_{r:hub=b} Z[i,r,t] = Q[b,i,t]
-    for (i, r_id, tt), z in Z_t.items():
-        b = r_hub[r_id]
-        Q_t[(b, i, tt)] = Q_t.get((b, i, tt), 0) + int(z)
-
-    # Remove zero entries — OPL must see Q[b,i,t]=0 as simply absent
-    Q_t = {k: v for k, v in Q_t.items() if v > 0}
+    # ── Load and induce Q ─────────────────────────────────────────────────────
+    Z_t, Q_t = _load_routes(selected, r_deps, r_cap, r_hub, qmin, t)
 
     return X_t, Z_t, Q_t
 
@@ -913,6 +974,7 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
                        - float(sol.Q_cum[(i, t - 1)]))
                 for i in inst.D
             }
+
             X_t, Z_t, Q_t = greedy_route_selection_and_loading_int(inst, t, qmin)
             # Keep qmin accessible to Phase 2 for service-level floor enforcement
             qmin_t = {i: int(math.ceil(qmin[i])) for i in inst.D}
@@ -943,6 +1005,8 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
 
             if DEBUG_MODE:
                 print(f"  OUT (before robust): {OUT}")
+
+
 
 
             # ── Convergence loop ─────────────────────────────────────────────
@@ -1010,7 +1074,7 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
 
             for s in inst.S:
                 Y_new, L_new, ach_new = inbound_assign_greedy_one_scenario_int(
-                    inst, s, t, Q_sum,
+                    inst, s, t, Q_sum
                 )
                 # Verify greedy achieved Q_sum exactly
                 for b in inst.B:
@@ -1081,9 +1145,14 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
                 sol.W_cum[(i, t)] = float(sol.W_cum[(i, t - 1)]) + float(w_it)
 
                 # I[i][t] using exact OPL formula (2.11)
+                # I is the SIGNED net inventory — can be negative when Q_cum < demand_cum.
+                # OPL's balance constraint uses the signed I directly.
+                # Ipo (non-negative part) is used only for holding cost.
                 de_cum_t = sum(float(inst.mu[(i, a)]) for a in inst.T if a <= t)
                 I_it_raw = float(sol.Q_cum[(i, t)]) - de_cum_t - float(sol.W_cum[(i, t)])
-                sol.Ipos[(i, t)] = max(0, int(round(I_it_raw)))
+                I_it_int = int(round(I_it_raw))
+                sol.I[(i, t)]    = I_it_int                # signed — exported to OPL
+                sol.Ipos[(i, t)] = max(0, I_it_int)        # non-neg — used for holding cost
 
             print(f"  Phase 3 done (t={t}).")
 
@@ -1150,7 +1219,7 @@ def export_solution_to_excel(
               for (f, b, k, s, t), v in sol.L.items() if int(v) != 0]
 
     # I and W: declared as dvar int / dvar int+ in OPL — export as integers.
-    I_rows = [{"i": i, "t": t, "value": int(sol.Ipos.get((i, t), 0))}
+    I_rows = [{"i": i, "t": t, "value": int(sol.I.get((i, t), 0))}
               for t in inst.T for i in inst.D]
     W_rows = [{"i": i, "t": t, "value": int(sol.W.get((i, t), 0))}
               for t in inst.T for i in inst.D]
@@ -1162,6 +1231,38 @@ def export_solution_to_excel(
                  "IN": sum(int(v) for (f, bb, k, ss, tt), v in sol.L.items()
                            if ss == s and tt == t and bb == b)}
                 for s in inst.S for t in inst.T for b in inst.B]
+
+    # ── CHECK-C: OPL balance constraint 2.11 ────────────────────────────────
+    # For each (i,t), OPL requires:
+    #   I[i,t] + W[i,t] = Q_cum[i,t] - demand_cum[i,t]
+    # i.e.  I[i,t] = Q_cum[i,t] - demand_cum[i,t] - W[i,t]
+    # If this doesn't hold exactly (integer), OPL will flag an infeasibility
+    # when the variables are fixed. We verify here before export.
+    balance_violations = 0
+    for i in inst.D:
+        for t in inst.T:
+            q_cum    = float(sol.Q_cum.get((i, t), 0))
+            de_cum   = sum(float(inst.mu[(i, a)]) for a in inst.T if a <= t)
+            w_cum    = float(sol.W_cum.get((i, t), 0))
+            I_export = int(sol.I.get((i, t), 0))
+            W_export = int(sol.W.get((i, t), 0))
+            # What OPL's LHS of balance equation gives:
+            expected_I = int(round(q_cum - de_cum - w_cum))
+            if I_export != expected_I:
+                balance_violations += 1
+                print(f"  [CHECK-C VIOLATION] i={i} t={t}: "
+                      f"exported I={I_export}  expected I={expected_I}  "
+                      f"(Q_cum={q_cum:.1f} de_cum={de_cum:.1f} W_cum={w_cum:.1f})")
+            # Also verify W[i,t] is consistent with W_cum
+            w_cum_prev = float(sol.W_cum.get((i, t-1), 0))
+            if abs((w_cum_prev + W_export) - w_cum) > 0.5:
+                balance_violations += 1
+                print(f"  [CHECK-C W_CUM] i={i} t={t}: "
+                      f"W_cum[t-1]={w_cum_prev:.1f} + W[t]={W_export} != W_cum[t]={w_cum:.1f}")
+    if balance_violations == 0:
+        print("[CHECK-C] OPL balance constraint 2.11: OK")
+    else:
+        print(f"[CHECK-C] OPL balance constraint 2.11: VIOLATIONS = {balance_violations}")
 
     df_req  = check_service_level_REQ(inst, sol, REQ)
     df_flow = check_flow_balance(inst, sol)
@@ -1626,11 +1727,20 @@ if __name__ == "__main__":
     print("\nAll phases completed.")
 
     # ── post-solve checks ────────────────────────────────────────────────────
+<<<<<<< Updated upstream
     # Multi-assignment check
+=======
+    # Multi-assignment check — OPL constraint 4: Σ_b Y[f,b,k,s,t] ≤ 1
+    # A specific (f,k) pair must not be assigned to more than one hub b
+    # within the same scenario s and period t.
+    # Supplier f CAN use different vehicles to serve different hubs — that is
+    # allowed. Only the (f,k) pair is restricted to one hub per (s,t).
+>>>>>>> Stashed changes
     viol = 0
     for s in inst.S:
         for t in inst.T:
             for f in inst.F:
+<<<<<<< Updated upstream
                 active = [(b, k) for b in inst.B for k in inst.K
                           if sol.Y.get((f, b, k, s, t), 0) == 1]
                 if len(active) > 1:
@@ -1638,6 +1748,69 @@ if __name__ == "__main__":
                     print(f"  [MULTI-ASSIGN] f={f} s={s} t={t}: "
                           f"active (b,k) pairs = {active}")
     print(f"[CHECK] multi-assign (sum_{{b,k}} Y > 1) count = {viol}")
+=======
+                for k in inst.K:
+                    hubs = [b for b in inst.B
+                            if sol.Y.get((f, b, k, s, t), 0) == 1]
+                    if len(hubs) > 1:
+                        viol += 1
+                        print(f"  [MULTI-ASSIGN] f={f} k={k} s={s} t={t}: "
+                              f"assigned to hubs {hubs}")
+    print(f"[CHECK] multi-assign (same (f,k) pair in >1 hub) count = {viol}")
+
+    # ── CHECK-D: route capacity Σ_i Z[i,r,t] <= cap[r] ──────────────────────
+    r_cap = {r.r_id: int_floor(r.capacity) for r in inst.routes}
+    cap_viol = 0
+    for t in inst.T:
+        for r in inst.routes:
+            load = sum(int(sol.Z.get((i, r.r_id, t), 0)) for i in inst.D)
+            if load > r_cap[r.r_id]:
+                cap_viol += 1
+                print(f"  [CHECK-D] r={r.r_id} t={t}: load={load} > cap={r_cap[r.r_id]}")
+    print(f"[CHECK-D] Route capacity: {'OK' if cap_viol==0 else f'VIOLATIONS={cap_viol}'}")
+
+    # ── CHECK-E: Z=0 wherever X=0 ────────────────────────────────────────────
+    xz_viol = 0
+    for (i, r_id, t), z in sol.Z.items():
+        if int(z) > 0 and sol.X.get((r_id, t), 0) == 0:
+            xz_viol += 1
+            print(f"  [CHECK-E] Z[{i},{r_id},{t}]={z} but X[{r_id},{t}]=0")
+    print(f"[CHECK-E] Z=0 when X=0: {'OK' if xz_viol==0 else f'VIOLATIONS={xz_viol}'}")
+
+    # ── CHECK-F: supply capacity Σ_bk L[f,b,k,s,t] <= supply[f,s,t] ─────────
+    sup_viol = 0
+    for s in inst.S:
+        for t in inst.T:
+            for f in inst.F:
+                used = sum(int(v) for (ff, b, k, ss, tt), v in sol.L.items()
+                           if ff == f and ss == s and tt == t)
+                avail = float(inst.supply.get((f, s, t), 0.0))
+                if used > avail + 0.5:
+                    sup_viol += 1
+                    print(f"  [CHECK-F] f={f} s={s} t={t}: used={used} > supply={avail:.1f}")
+    print(f"[CHECK-F] Supply capacity: {'OK' if sup_viol==0 else f'VIOLATIONS={sup_viol}'}")
+
+    # ── CHECK-G: vehicle capacity Σ_f L[f,b,k,s,t] <= theta[k] ──────────────
+    veh_viol = 0
+    for s in inst.S:
+        for t in inst.T:
+            for k in inst.K:
+                used = sum(int(v) for (f, b, kk, ss, tt), v in sol.L.items()
+                           if kk == k and ss == s and tt == t)
+                cap  = int_floor(inst.theta.get(k, 0))
+                if used > cap:
+                    veh_viol += 1
+                    print(f"  [CHECK-G] k={k} s={s} t={t}: used={used} > cap={cap}")
+    print(f"[CHECK-G] Vehicle capacity: {'OK' if veh_viol==0 else f'VIOLATIONS={veh_viol}'}")
+
+    # ── CHECK-H: W[i,t]=0 for t < shelf_life ─────────────────────────────────
+    w_viol = 0
+    for (i, t), w in sol.W.items():
+        if t < inst.shelf_life and int(w) > 0:
+            w_viol += 1
+            print(f"  [CHECK-H] W[{i},{t}]={w} but shelf_life={inst.shelf_life}")
+    print(f"[CHECK-H] W=0 before shelf_life: {'OK' if w_viol==0 else f'VIOLATIONS={w_viol}'}")
+>>>>>>> Stashed changes
 
     # Y=1 but L=0 check
     bad_yl = sum(

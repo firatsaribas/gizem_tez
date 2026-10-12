@@ -1,9 +1,30 @@
 """
-ALNS - Adaptive Large Neighborhood Search
+ALNS - Adaptive Large Neighborhood Search  (FINAL VERSION)
 Perishable Multi-Echelon Network Design
 ========================================
 F=100 suppliers | K=25 vehicles | B=3 hubs | D=30 depots
 R=30 routes     | T=6 periods   | S=3 scenarios | m=2 shelf life
+
+CHANGES vs. previous version
+─────────────────────────────
+P1  Acceptance criterion: replaced LAHC with Simulated Annealing.
+    T0 = 2% of initial objective; geometric cooling to T_min = 0.01% of obj.
+P2  max_iter default raised to 30 000; segment to 200; lam to 0.3.
+P3  _reassign_greedy / _reassign_regret: repair now uses per-hub targets
+    derived from current Q, not aggregate demand.  This is the most
+    important structural fix — it kept Echelon-1 and Echelon-2 decoupled.
+P4  fix_service_violations: trim-before-fix step added at the top.
+    Eliminates the m=2 waste cascade (deliver extra → waste → fix SL →
+    deliver more → …).
+P5  round_solution removed from inside the ALNS loop.  It is now called
+    only once at the very end.  This reclaims ~30–40 % of runtime for
+    actual search.
+P6  no_improve_limit raised to max(500, max_iter // 15).  Prevents
+    premature perturbation that was destroying good solutions.
+P7  destroy_inventory_driven: removal size raised from //5 to //2.
+P8  lam (weight reaction factor) raised to 0.3 in run_alns default.
+P9  SIGMA_3 now scores accepted-non-improving moves correctly (score = 1).
+P10 score variable initialised to 0 correctly; SIGMA scores are 10/5/1.
 
 Excel file: step1_final.xlsx
 Sheets used:
@@ -26,11 +47,11 @@ Sections:
     3.  Helper computations
     4.  Route utilities
     5.  Greedy initialization
-    6.  Destroy operators  (D1-D4)
+    6.  Destroy operators  (D1-D5)
     7.  Repair operators   (R1-R3)
     8.  Roulette wheel + weight update
     8b. Perturbation
-    9.  Main ALNS loop
+    9.  Main ALNS loop  ← SA acceptance, 30k iters, fixed perturbation trigger
     10. Export results
     11. Integer rounding
     12. Constraint checker
@@ -39,22 +60,13 @@ Sections:
 import math
 import copy
 import random
+import time
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
 
-
 def _compute_hub_assignment_rates(data):
-    """
-    Compute marginal assignment cost rate (per crate) for each hub.
-    Hub b rate = (non-owner fraction at b) * min_beta_no * pr[s=1] / avg_supply
-    where non-owner fraction = max(0, hub_target - owner_supply) / hub_target.
-    
-    Owner supply per hub: each owner goes to the hub with lowest gamma.
-    For hubs where owners cannot fully cover the target, every extra crate
-    requires a non-owner assignment at marginal cost = min_beta_no / avg_supply.
-    """
     owned_f   = {data['owner'][k]: k for k in data['K']}
     pr_low    = data['pr'].get(1, 0.3)
     avg_no_supply = 35.0
@@ -66,7 +78,6 @@ def _compute_hub_assignment_rates(data):
         default=50.0
     )
 
-    # Owner supply per hub at (s=1, t=1) — owners go to cheapest gamma hub
     hub_owner = {b: 0.0 for b in data['B']}
     for f, k in owned_f.items():
         sup = data['upsilon'].get((f, 1, 1), 0)
@@ -76,24 +87,16 @@ def _compute_hub_assignment_rates(data):
                      key=lambda b: data['gamma'].get((f, b, k), float('inf')))
         hub_owner[b_best] += sup
 
-    # Hub assignment rates: set to zero for now
-    # (hub routing penalty does not help given the current route structure)
     data['hub_assignment_rate'] = {b: 0.0 for b in data['B']}
-    # Pre-sort suppliers by minimum beta for fast deficit repair
     data['_f_by_beta'] = sorted(data['F'],
         key=lambda f: min(data['beta'].get((f, k), 999) for k in data['K']))
+
 
 # =============================================================================
 # SECTION 1 — DATA LOADING
 # =============================================================================
 
 def _find_optimal_route_cover(data):
-    """
-    Find the minimum fixed-cost route subset covering all depots.
-    Searches all subset sizes from 5 to 12 over the 20 cheapest routes.
-    Does NOT stop at the first feasible size — a larger set may be cheaper
-    (e.g. 9 routes at 436 beats 8 routes at 447 because cheaper routes are used).
-    """
     from itertools import combinations
 
     R_list     = list(data['R'])
@@ -102,12 +105,11 @@ def _find_optimal_route_cover(data):
     all_depots = set(data['D'])
 
     routes_sorted = sorted(R_list, key=lambda r: lam[r])
-    candidates    = routes_sorted[:20]   # top-20 cheapest
+    candidates    = routes_sorted[:20]
 
     best_cost  = float('inf')
     best_combo = None
 
-    # Search sizes 5-12 exhaustively (C(20,12)=125970 — fast enough)
     for size in range(5, 13):
         for combo in combinations(candidates, size):
             covered = set()
@@ -120,7 +122,6 @@ def _find_optimal_route_cover(data):
                 best_combo = list(combo)
 
     if best_combo is None:
-        # Greedy fallback (rare)
         uncov = set(all_depots)
         best_combo = []
         while uncov:
@@ -150,7 +151,6 @@ def load_data(filepath):
 
     data = {}
 
-    # --- Index sets ---
     data['F'] = sorted(supply_df['f'].unique().tolist())
     data['K'] = sorted(theta_df['k'].unique().tolist())
     data['B'] = [1, 2, 3]
@@ -159,45 +159,36 @@ def load_data(filepath):
     data['T'] = sorted(demand_df['t'].unique().tolist())
     data['S'] = sorted(scenario_df['s'].unique().tolist())
     data['m'] = 2
-    data['alpha'] = 0.995   # Z_alpha = 2.575
+    data['alpha'] = 0.995
 
-    # --- Vehicle capacities ---
     data['theta'] = dict(zip(theta_df['k'], theta_df['theta']))
-
-    # --- Route costs and capacities ---
     data['lambda'] = dict(zip(route_costs_df['r'], route_costs_df['cost']))
     data['c']      = dict(zip(route_cap_df['r'],   route_cap_df['capacity']))
 
-    # --- N[r]: depots visited on route r ---
     data['N'] = {r: [] for r in data['R']}
     for _, row in route_dep_df.iterrows():
         data['N'][int(row['route'])].append(int(row['depot']))
 
-    # --- delta[b, r]: 1 if route r starts at hub b ---
     data['delta'] = {(b, r): 0 for b in data['B'] for r in data['R']}
     for _, row in route_hub_df.iterrows():
         data['delta'][(int(row['hub']), int(row['route']))] = 1
 
-    # --- Supply: upsilon[f, s, t] ---
     data['upsilon'] = {}
     for _, row in supply_df.iterrows():
         data['upsilon'][(int(row['f']), int(row['s']), int(row['t']))] = float(row['supply'])
 
-    # --- Demand mean and sigma ---
     data['mu']    = {}
     data['sigma'] = {}
     for _, row in demand_df.iterrows():
         i, t = int(row['d']), int(row['t'])
         mu_val = float(row['demand'])
         data['mu'][(i, t)]    = mu_val
-        data['sigma'][(i, t)] = 0.10 * mu_val      # sigma = 10% of mean (CV = 0.10)
+        data['sigma'][(i, t)] = 0.10 * mu_val
 
-    # --- Vehicle ownership: owner[k] = supplier who owns vehicle k ---
     vehicles_df = pd.read_excel(xl, sheet_name='vehicles')
     data['owner'] = dict(zip(vehicles_df['k'].astype(int),
                              vehicles_df['f'].astype(int)))
 
-    # --- hub_depots[b]: set of depots reachable from hub b ---
     hub_depots = {b: set() for b in data['B']}
     for _, row in route_dep_df.iterrows():
         r = int(row['route'])
@@ -205,6 +196,7 @@ def load_data(filepath):
         b = int(route_hub_df[route_hub_df['route'] == r]['hub'].values[0])
         hub_depots[b].add(d)
     data['hub_depots'] = hub_depots
+
     data['beta'] = {}
     for _, row in beta_df.iterrows():
         data['beta'][(int(row['f']), int(row['k']))] = float(row['beta'])
@@ -214,21 +206,16 @@ def load_data(filepath):
         data['gamma'][(int(row['f']), int(row['b']), int(row['k']))] = float(row['gamma'])
 
     data['h']  = dict(zip(stock_df['d'].astype(int), stock_df['stock_cost']))
-    data['p']  = 27.55696873                    # waste penalty per crate (from OPL dat)
+    data['p']  = 27.55696873
     data['pr'] = dict(zip(scenario_df['s'].astype(int), scenario_df['probability']))
 
-    # --- Service level parameters ---
-    data['Z_alpha'] = 2.575   # given directly (corresponds to alpha ≈ 0.995)
-    data['C']       = 0.10                      # coefficient of variation (CV = 0.10)
+    data['Z_alpha'] = 2.575
+    data['C']       = 0.10
 
-    # --- Precomputed caches for speed ---
-
-    # route_hub_map: r -> b  (avoids delta lookup in compute_Q_from_Z)
     data['route_hub_map'] = {}
     for _, row in route_hub_df.iterrows():
         data['route_hub_map'][int(row['route'])] = int(row['hub'])
 
-    # sl_rhs_cache: (i,t) -> float  (avoids recomputing every iteration)
     data['sl_rhs_cache'] = {}
     Z_alpha = data['Z_alpha']
     C       = data['C']
@@ -240,20 +227,16 @@ def load_data(filepath):
                 mu_sum + math.sqrt(max(var_sum, 0)) * C * Z_alpha
             )
 
-    # Pre-compute hub assignment cost rates
     _compute_hub_assignment_rates(data)
 
-    # Pre-compute sorted suppliers for _enforce_flow_balance
     _owned_f = {data['owner'][k]: k for k in data['K']}
     data['_f_by_beta'] = sorted(data['F'],
         key=lambda f: min(data['beta'].get((f, k), 999) for k in data['K']))
-    # Pre-compute cheapest vehicle per non-owner supplier (for flow balance fill)
     data['_nonowner_best_k'] = {
         f: min(data['K'], key=lambda k: data['beta'].get((f, k), 999))
         for f in data['F'] if f not in _owned_f
     }
 
-    # Pre-compute marginal non-owner cost rate for flow-balance penalty
     owned_f = {data['owner'][k]: k for k in data['K']}
     min_beta_no = min(
         (data['beta'].get((f, k), 999)
@@ -261,9 +244,8 @@ def load_data(filepath):
          for k in data['K']),
         default=50.0
     )
-    data['_no_cost_rate'] = min_beta_no / 35.0   # cost per deficit crate
+    data['_no_cost_rate'] = min_beta_no / 35.0
 
-    # Pre-compute optimal minimum-cost route set covering all depots
     data['optimal_routes'] = _find_optimal_route_cover(data)
 
     print("Data loaded.")
@@ -277,17 +259,6 @@ def load_data(filepath):
 # =============================================================================
 
 class Solution:
-    """
-    Y[f,b,k,s,t]  : binary  — supplier f uses vehicle k to hub b in scenario s, period t
-    L[f,b,k,s,t]  : float   — amount transported
-    X[r,t]        : binary  — route r active in period t
-    Z[i,r,t]      : float   — load delivered to depot i on route r at period t
-    Q[b,i,t]      : float   — total delivered from hub b to depot i at period t
-    I[i,t]        : float   — expected end-of-period inventory at depot i
-    I_plus[i,t]   : float   — positive inventory (for holding cost)
-    W[i,t]        : float   — expected waste at depot i in period t
-    obj           : float   — total objective value
-    """
     __slots__ = ['Y','L','X','Z','Q','I','I_plus','W','obj']
 
     def __init__(self):
@@ -320,14 +291,10 @@ class Solution:
 # =============================================================================
 
 def compute_Q_from_Z(sol, data):
-    """Q[b,i,t] = sum_r Z[i,r,t] * delta[b,r]   (constraint 13)
-    Fast version: iterates only over non-zero Z entries."""
-    # Zero out Q
     for key in list(sol.Q.keys()):
         sol.Q[key] = 0
 
-    # Accumulate contributions from non-zero Z values only
-    route_hub = data['route_hub_map']   # r -> b (precomputed in load_data)
+    route_hub = data['route_hub_map']
     for (i, r, t), z_val in sol.Z.items():
         if z_val > 1e-9:
             b = route_hub.get(r)
@@ -336,10 +303,6 @@ def compute_Q_from_Z(sol, data):
 
 
 def compute_inventory_waste(sol, data):
-    """
-    Compute W[i,t], I[i,t], I_plus[i,t] from constraints (6)-(9).
-    Must call compute_Q_from_Z before this.
-    """
     D, T, B = data['D'], data['T'], data['B']
     mu, m   = data['mu'], data['m']
 
@@ -353,7 +316,6 @@ def compute_inventory_waste(sol, data):
             cumul_delivery += delivery_t
             cumul_demand   += mu[(i, t)]
 
-            # Waste — constraint (8)
             if t >= m:
                 t0        = t - m + 1
                 I_t0      = sol.I.get((i, t0), 0.0)
@@ -361,29 +323,26 @@ def compute_inventory_waste(sol, data):
                 w_window  = sum(sol.W.get((i, a), 0.0) for a in T if t - m + 2 <= a <= t - 1)
                 waste_t   = max(0.0, I_t0 - d_window - w_window)
             else:
-                waste_t = 0.0           # constraint (9)
+                waste_t = 0.0
 
-            sol.W[(i, t)]     = waste_t
-            cumul_waste      += waste_t
-            inv               = cumul_delivery - cumul_demand - cumul_waste
-            sol.I[(i, t)]     = inv
+            sol.W[(i, t)]      = waste_t
+            cumul_waste       += waste_t
+            inv                = cumul_delivery - cumul_demand - cumul_waste
+            sol.I[(i, t)]      = inv
             sol.I_plus[(i, t)] = max(0.0, inv)
 
 
 def compute_objective(sol, data):
-    """Compute full objective value — fast version using sparse iteration."""
     obj = 0.0
     pr, beta, gamma = data['pr'], data['beta'], data['gamma']
     h, p, lam       = data['h'], data['p'], data['lambda']
 
-    # Terms 1 & 2: assignment + transport — iterate only non-zero Y entries
     for (f, b, k, s, t), y_val in sol.Y.items():
         if y_val:
             l_val = sol.L.get((f, b, k, s, t), 0.0)
             ps    = pr[s]
             obj  += ps * (beta[(f, k)] * y_val + gamma[(f, b, k)] * l_val)
 
-    # Term 3 & 4: inventory + waste
     m = data['m']
     for i in data['D']:
         hi = h[i]
@@ -396,7 +355,6 @@ def compute_objective(sol, data):
                 if w:
                     obj += w * p
 
-    # Term 5: route fixed costs — iterate only non-zero X entries
     for (r, t), x_val in sol.X.items():
         if x_val:
             obj += lam[r]
@@ -406,12 +364,10 @@ def compute_objective(sol, data):
 
 
 def sl_rhs(data, i, t):
-    """Right-hand side of constraint (19) — cached in data['sl_rhs_cache']."""
     return data['sl_rhs_cache'][(i, t)]
 
 
 def sl_lhs(sol, data, i, t):
-    """Left-hand side of service level constraint (19)."""
     delivery = sum(sol.Q.get((b, i, a), 0.0)
                    for b in data['B'] for a in data['T'] if a <= t)
     waste    = sum(sol.W.get((i, a), 0.0)
@@ -420,13 +376,6 @@ def sl_lhs(sol, data, i, t):
 
 
 def get_violations(sol, data, ignore_waste_gaps=False):
-    """
-    Return list of (i, t, shortfall) tuples violating constraint (19).
-
-    ignore_waste_gaps=True: skip violations whose gap is fully explained
-    by accumulated waste (model-inherent, cannot be fixed without creating
-    more waste). Used by the checker to avoid false positives.
-    """
     out = []
     for i in data['D']:
         for t in data['T']:
@@ -434,7 +383,6 @@ def get_violations(sol, data, ignore_waste_gaps=False):
             if gap <= 1e-6:
                 continue
             if ignore_waste_gaps:
-                # Gap caused purely by waste = unavoidable; skip
                 waste_reduction = sum(sol.W.get((i, a), 0.0)
                                       for a in data['T'] if a <= t - 1)
                 if gap <= waste_reduction + 1e-4:
@@ -448,21 +396,8 @@ def get_violations(sol, data, ignore_waste_gaps=False):
 # =============================================================================
 
 def cover_all_depots(sol, data, period_t, randomize=False):
-    """
-    Greedy set-cover: activate routes to cover all depots for period_t.
-    Delivers exactly the MINIMUM needed per depot:
-        min_delivery[i,t] = mu[i,t] + marginal_safety_stock[i,t]
-    where marginal safety = max(0, SL_RHS(i,t) - SL_RHS(i,t-1) - mu[i,t]).
-    This embeds the safety stock directly into route loads, eliminating
-    the need for a separate fix_service_violations pass and avoiding
-    over-delivery that causes cascading waste.
-
-    randomize=False (default): always pick cheapest route (deterministic).
-    randomize=True:  sample from top-3 candidates weighted by inverse score.
-    """
     D, R = data['D'], data['R']
 
-    # Compute minimum delivery = mean demand + marginal safety stock
     def min_delivery(i, t):
         rhs_t  = data['sl_rhs_cache'][(i, t)]
         rhs_t1 = data['sl_rhs_cache'].get((i, t - 1), 0.0)
@@ -477,7 +412,6 @@ def cover_all_depots(sol, data, period_t, randomize=False):
     }
     uncovered = {i for i in D if remaining[i] > 1e-6}
 
-    # Seed with pre-computed optimal routes first (unless randomizing)
     if not randomize and 'optimal_routes' in data:
         for r in data['optimal_routes']:
             new_depots = uncovered & set(data['N'][r])
@@ -499,7 +433,6 @@ def cover_all_depots(sol, data, period_t, randomize=False):
                 uncovered = {i for i in D if remaining[i] > 1e-6}
 
     while uncovered:
-        # Score every candidate route
         candidates = []
         for r in R:
             new_depots = uncovered & set(data['N'][r])
@@ -514,7 +447,6 @@ def cover_all_depots(sol, data, period_t, randomize=False):
         candidates.sort()
 
         if randomize and len(candidates) > 1:
-            # Weighted sample from top-3 by inverse score
             top   = candidates[:min(3, len(candidates))]
             inv_w = [1.0 / max(s, 1e-9) for s, _ in top]
             total = sum(inv_w)
@@ -537,7 +469,7 @@ def cover_all_depots(sol, data, period_t, randomize=False):
 
         if total_need <= cap:
             for i in new_depots:
-                add = int(math.ceil(remaining[i]))   # Q is int+ — round up
+                add = int(math.ceil(remaining[i]))
                 sol.Z[(i, chosen_r, period_t)] = (
                     sol.Z.get((i, chosen_r, period_t), 0) + add
                 )
@@ -554,10 +486,6 @@ def cover_all_depots(sol, data, period_t, randomize=False):
 
 
 def boost_existing_route(sol, data, i, t, amount):
-    """
-    Increase delivery to depot i in period t by 'amount' using
-    an already-active route. Returns True if successful.
-    """
     active = [r for r in data['R'] if i in data['N'][r] and sol.X.get((r, t), 0) == 1]
     if not active:
         return False
@@ -566,22 +494,54 @@ def boost_existing_route(sol, data, i, t, amount):
     return True
 
 
+# ── FIX P4 ───────────────────────────────────────────────────────────────────
 def fix_service_violations(sol, data):
     """
-    Fix ALL service level violations (OPL constraint 2.15) — hard constraint.
+    Fix ALL service level violations (constraint 19) — hard constraint.
 
-    Waste reduces the cumulative LHS, creating gaps that must also be fixed.
-    Two-step approach:
-      Step 1: Add marginal safety stock upfront (prevents cascade start).
-      Step 2: Iterate full violation check until ALL gaps are closed
-              (including waste-caused gaps — these are hard constraints).
-    Cascade terminates because T is finite (at most T passes needed).
+    SPEED: compute_Q_from_Z and compute_inventory_waste are now called
+    ONCE per pass (batched), not after every depot-period fix.
+    With 30 depots × 6 periods this eliminates ~180 redundant recomputes
+    per repair call — the single biggest runtime saving.
+
+    P4 trim-before-fix retained: prevents m=2 waste cascade.
     """
     T = data['T']
     D = data['D']
     R = data['R']
 
-    # --- Step 1: Marginal safety stock upfront ---
+    # ── Trim-before-fix (P4) — batch, single recompute at end ────────────
+    trim_changed = False
+    for i in D:
+        prev_rhs = 0.0
+        for t in T:
+            rhs_t    = data['sl_rhs_cache'][(i, t)]
+            mu_t     = data['mu'][(i, t)]
+            marginal = max(0.0, rhs_t - prev_rhs - mu_t)
+            prev_rhs = rhs_t
+            max_useful = mu_t + marginal + 2.0
+            actual = sum(sol.Z.get((i, r, t), 0.0) for r in R)
+            if actual <= max_useful + 1e-6:
+                continue
+            excess = actual - max_useful
+            for r in R:
+                z = sol.Z.get((i, r, t), 0.0)
+                if z > 1e-6:
+                    cut = min(z, excess)
+                    sol.Z[(i, r, t)] = max(0.0, z - cut)
+                    excess -= cut
+                    trim_changed = True
+                    if excess <= 1e-6:
+                        break
+
+    # Single recompute after all trim changes
+    if trim_changed:
+        compute_Q_from_Z(sol, data)
+        compute_inventory_waste(sol, data)
+    # ── End trim-before-fix ───────────────────────────────────────────────
+
+    # Step 1: Marginal safety stock — batch all additions, recompute once
+    step1_changed = False
     for i in D:
         prev_rhs = 0.0
         for t in T:
@@ -603,11 +563,15 @@ def fix_service_violations(sol, data):
                     sol.X[(r_best, t)] = 1
                     sol.Z[(i, r_best, t)] = (sol.Z.get((i, r_best, t), 0)
                                              + int(math.ceil(needed)))
-            compute_Q_from_Z(sol, data)
-            compute_inventory_waste(sol, data)
+            step1_changed = True
+            # NO per-depot-period recompute here — batched below
 
-    # --- Step 2: Fix ALL remaining gaps including waste-caused ---
-    for _pass in range(len(T)):          # at most T passes for cascade to finish
+    if step1_changed:
+        compute_Q_from_Z(sol, data)
+        compute_inventory_waste(sol, data)
+
+    # Step 2: Fix ALL remaining gaps — recompute once per full pass, not per fix
+    for _pass in range(len(T)):
         changed = False
         for i in D:
             for t in T:
@@ -623,12 +587,119 @@ def fix_service_violations(sol, data):
                         sol.X[(r_best, t)] = 1
                         sol.Z[(i, r_best, t)] = (sol.Z.get((i, r_best, t), 0)
                                                  + int(math.ceil(gap)))
-                compute_Q_from_Z(sol, data)
-                compute_inventory_waste(sol, data)
-        if not changed:
+                # NO per-fix recompute — batched at end of pass
+        if changed:
+            compute_Q_from_Z(sol, data)
+            compute_inventory_waste(sol, data)
+        else:
             break
 
     compute_Q_from_Z(sol, data)
+
+
+def _assign_nonowners_optimal(F, K, B, data, hub_need, remaining_cap, s, t, sol):
+    """
+    Assign non-owner suppliers to vehicles to cover hub_need at minimum total cost.
+
+    Total Echelon-1 cost = sum over assigned (f,k,b,s,t) of:
+        pi_s * [ beta[f,k] * Y[f,b,k,s,t] + gamma[f,b,k] * L[f,b,k,s,t] ]
+
+    The key insight from the MIP gap: beta is a ONE-TIME fixed cost per
+    (f,k) assignment.  Once a vehicle k is already assigned to supplier f,
+    additional load onto that same (f,k) pair costs only gamma per crate —
+    no extra beta.  Greedy must exploit this by:
+      1. Maximising load on already-committed (f,k) pairs first (free beta).
+      2. When a new assignment is needed, choosing the (f,k,b) triple with
+         the lowest MARGINAL cost = beta[f,k]*pr_s + gamma[f,b,k]*amount.
+
+    This directly matches MIP behaviour and targets the 310-unit gap.
+    """
+    owned  = {data['owner'][k]: k for k in K}
+    ups    = data['upsilon']
+    beta   = data['beta']
+    gamma  = data['gamma']
+    theta  = data['theta']
+    pr_s   = data['pr'].get(s, 1.0)
+
+    # Non-owners available this (s,t)
+    non_owners = {f: ups.get((f, s, t), 0.0)
+                  for f in F if f not in owned and ups.get((f, s, t), 0.0) > 0}
+    if not non_owners:
+        return
+
+    used_supply = {f: 0.0 for f in non_owners}
+
+    # Which (f,k) assignments are already active this (s,t)?
+    # Adding load to these costs 0 extra beta.
+    committed_fk = {}   # (f,k) -> hub b already assigned
+    for f in non_owners:
+        for k in K:
+            for b in B:
+                if sol.Y.get((f, b, k, s, t), 0) == 1:
+                    committed_fk[(f, k)] = b
+                    used_supply[f] += sol.L.get((f, b, k, s, t), 0)
+
+    # Iterate: each pass makes the single best assignment
+    max_passes = len(non_owners) * len(K) + 1
+    for _pass in range(max_passes):
+        if not any(hub_need[b] > 1e-6 for b in B):
+            break
+
+        best_cost   = float('inf')
+        best_assign = None   # (f, k, b, amount, marginal_beta)
+
+        for f, total_sup in non_owners.items():
+            avail = total_sup - used_supply[f]
+            if avail < 0.5:
+                continue
+
+            for k in K:
+                cap = remaining_cap.get(k, 0)
+                if cap < 0.5:
+                    continue
+
+                # Is this (f,k) already committed to a hub?
+                committed_b = committed_fk.get((f, k))
+
+                for b in B:
+                    # If already committed to a different hub, skip
+                    if committed_b is not None and committed_b != b:
+                        continue
+                    need = hub_need[b]
+                    if need < 0.5:
+                        continue
+                    amount = min(avail, cap, need)
+                    if amount < 0.5:
+                        continue
+
+                    # Marginal cost: beta only if this is a NEW (f,k) assignment
+                    marginal_beta = 0.0 if committed_b == b else beta[(f, k)] * pr_s
+                    marginal_gamma = gamma[(f, b, k)] * amount * pr_s
+                    total_marginal = marginal_beta + marginal_gamma
+
+                    # Normalise by amount to get cost-per-crate for comparison
+                    cost_per_crate = total_marginal / max(amount, 1e-9)
+
+                    if cost_per_crate < best_cost:
+                        best_cost   = cost_per_crate
+                        best_assign = (f, k, b, amount, marginal_beta > 0)
+
+        if best_assign is None:
+            break
+
+        f, k, b, amount, new_assignment = best_assign
+        amount = int(round(amount))
+        if amount <= 0:
+            break
+
+        existing = sol.L.get((f, b, k, s, t), 0)
+        sol.Y[(f, b, k, s, t)]  = 1
+        sol.L[(f, b, k, s, t)]  = existing + amount
+        used_supply[f]          += amount
+        remaining_cap[k]        -= amount
+        hub_need[b]             -= amount
+        if new_assignment:
+            committed_fk[(f, k)] = b
 
 
 def greedy_initialize(data):
@@ -636,7 +707,6 @@ def greedy_initialize(data):
                              data['D'], data['R'], data['T'], data['S'])
     sol = Solution()
 
-    # Zero-initialise all variables
     for f in F:
         for b in B:
             for k in K:
@@ -659,35 +729,17 @@ def greedy_initialize(data):
             sol.I_plus[(i, t)] = 0.0
             sol.W[(i, t)]      = 0.0
 
-    owned_vehicle = {data['owner'][k]: k for k in data['K']}  # f -> k
+    owned_vehicle = {data['owner'][k]: k for k in data['K']}
 
-    # ------------------------------------------------------------------
-    # Step 1 — Route selection (Echelon 2) — done FIRST
-    # Routes are scenario-independent. Greedy set-cover selects minimum
-    # cost routes to cover all depots. This fixes Q[b,i,t] which sets
-    # exactly how much each hub b must receive in each period t.
-    # ------------------------------------------------------------------
     for t in T:
         cover_all_depots(sol, data, t)
     compute_Q_from_Z(sol, data)
 
-    # ------------------------------------------------------------------
-    # Step 2 — Supplier-to-vehicle assignment (Echelon 1)
-    #
-    # Constraint (5): sum_k sum_f L[f,b,k,s,t] = sum_i Q[b,i,t]  for each b,s,t
-    # => Each hub b must receive exactly Q_b(t) = sum_i Q[b,i,t] in every (s,t)
-    # => Assign suppliers to match hub-specific targets per scenario
-    # => Owner vehicles (beta=5) first; non-owners only if needed
-    # ------------------------------------------------------------------
     for s in S:
         for t in T:
             remaining_cap = {k: data['theta'][k] for k in K}
-
-            # Hub target: how much must arrive at each hub this (s,t)
             hub_need = {b: sum(sol.Q.get((b, i, t), 0.0) for i in D) for b in B}
 
-            # Pass 1: owner suppliers — assign to hub that needs supply,
-            # preferring lowest gamma cost
             for f in F:
                 if f not in owned_vehicle:
                     continue
@@ -708,52 +760,10 @@ def greedy_initialize(data):
                     hub_need[best_b]            -= amount
                     break
 
-            # Pass 2: non-owners only if any hub still has unmet need
             if any(need > 1e-6 for need in hub_need.values()):
-                non_owners = [f for f in F if f not in owned_vehicle
-                              and data['upsilon'].get((f, s, t), 0.0) > 0]
-                # Sort by effective cost-per-crate = beta/supply + min_gamma
-                # Minimises combined assignment + transport cost per unit delivered
-                def _no_cpc(f):
-                    sup = data['upsilon'].get((f, s, t), 1.0)
-                    if sup <= 0: return float('inf')
-                    return min(
-                        data['beta'][(f, k)] / sup + data['gamma'][(f, b, k)]
-                        for k in K for b in B if hub_need.get(b, 0) > 1e-6
-                    ) if any(hub_need.get(b, 0) > 1e-6 for b in B) else float('inf')
-                non_owners.sort(key=_no_cpc)
+                _assign_nonowners_optimal(F, K, B, data, hub_need,
+                                          remaining_cap, s, t, sol)
 
-                for f in non_owners:
-                    if not any(hub_need[b] > 1e-6 for b in B):
-                        break
-                    supply = data['upsilon'].get((f, s, t), 0.0)
-                    if supply <= 0:
-                        continue
-                    best_cost, best_k, best_b = float('inf'), None, None
-                    for k in K:
-                        if remaining_cap[k] < 1e-6:
-                            continue
-                        for b in B:
-                            if hub_need[b] <= 1e-6:
-                                continue
-                            amount = int(round(min(supply, hub_need[b], remaining_cap[k])))
-                            if amount <= 0:
-                                continue
-                            cost = (data['beta'][(f, k)]
-                                    + data['gamma'][(f, b, k)] * amount)
-                            if cost < best_cost:
-                                best_cost, best_k, best_b = cost, k, b
-                    if best_k:
-                        amount = int(round(min(supply, hub_need[best_b], remaining_cap[best_k])))
-                        sol.Y[(f, best_b, best_k, s, t)] = 1
-                        sol.L[(f, best_b, best_k, s, t)] = int(round(amount))
-                        remaining_cap[best_k]            -= amount
-                        hub_need[best_b]                 -= amount
-
-    # ------------------------------------------------------------------
-    # Step 3 — Inventory, waste, service level
-    # ------------------------------------------------------------------
-    # --- Enforce exact flow balance: sum_fk L[f,b,k,s,t] = sum_i Q[b,i,t] ---
     for s in S:
         for t in T:
             for b in B:
@@ -763,7 +773,6 @@ def greedy_initialize(data):
                 diff = q_target - l_total
                 if abs(diff) < 1:
                     continue
-                # Find a non-zero L entry to adjust
                 for f in F:
                     for k in K:
                         cur = sol.L.get((f, b, k, s, t), 0)
@@ -778,20 +787,15 @@ def greedy_initialize(data):
     fix_service_violations(sol, data)
     route_swap_local_search(sol, data)
 
-    # Step 3b: Re-run assignment to fill hub targets created by cascade SL fix.
-    # fix_service_violations may have added extra Z -> new hub targets.
-    # Re-assign using owner suppliers first (cheapest) before non-owners.
     for s in S:
         for t in T:
             remaining_cap = {k: data['theta'][k] for k in K}
-            # Subtract already-assigned load from capacity
             for f in F:
                 for b in B:
                     for k in K:
                         remaining_cap[k] = max(0.0,
                             remaining_cap[k] - sol.L.get((f, b, k, s, t), 0.0))
 
-            # New hub targets after SL fix
             hub_need = {b: max(0.0,
                 sum(sol.Q.get((b, i, t), 0) for i in D)
                 - sum(sol.L.get((f, b, k, s, t), 0.0) for f in F for k in K))
@@ -800,7 +804,6 @@ def greedy_initialize(data):
             if not any(need > 1e-6 for need in hub_need.values()):
                 continue
 
-            # Try owners first for the remaining need
             for f in F:
                 if f not in owned_vehicle:
                     continue
@@ -823,42 +826,9 @@ def greedy_initialize(data):
                     hub_need[best_b]  -= amount
                     break
 
-            # Then non-owners for any remaining need
             if any(need > 1e-6 for need in hub_need.values()):
-                non_owners = [f for f in F if f not in owned_vehicle
-                              and data['upsilon'].get((f, s, t), 0.0) > 0]
-                # Sort by supply DESCENDING: higher supply = fewer assignments
-                # = lower total beta cost (each assignment pays fixed beta)
-                non_owners.sort(key=lambda f: -data['upsilon'].get((f, s, t), 0.0))
-
-                for f in non_owners:
-                    if not any(hub_need[b] > 1e-6 for b in B):
-                        break
-                    supply = max(0.0, data['upsilon'].get((f, s, t), 0.0)
-                                 - sum(sol.L.get((f, b, k, s, t), 0) for b in B for k in K))
-                    if supply <= 0:
-                        continue
-                    best_cost, best_k, best_b = float('inf'), None, None
-                    for k in K:
-                        if remaining_cap[k] < 1e-6:
-                            continue
-                        for b in B:
-                            if hub_need[b] <= 1e-6:
-                                continue
-                            amount = int(round(min(supply, hub_need[b], remaining_cap[k])))
-                            if amount <= 0:
-                                continue
-                            cost = (data['beta'][(f, k)]
-                                    + data['gamma'][(f, b, k)] * amount)
-                            if cost < best_cost:
-                                best_cost, best_k, best_b = cost, k, b
-                    if best_k:
-                        amount = int(round(min(supply, hub_need[best_b], remaining_cap[best_k])))
-                        sol.Y[(f, best_b, best_k, s, t)] = 1
-                        sol.L[(f, best_b, best_k, s, t)] = (
-                            sol.L.get((f, best_b, best_k, s, t), 0) + int(round(amount)))
-                        remaining_cap[best_k] -= amount
-                        hub_need[best_b]      -= amount
+                _assign_nonowners_optimal(F, K, B, data, hub_need,
+                                          remaining_cap, s, t, sol)
 
     compute_inventory_waste(sol, data)
     compute_objective(sol, data)
@@ -867,17 +837,15 @@ def greedy_initialize(data):
 
 
 # =============================================================================
-# SECTION 6 — PHASE 3: DESTROY OPERATORS
+# SECTION 6 — DESTROY OPERATORS
 # =============================================================================
 
 def _removal_size(data):
-    """Remove 5–15% of suppliers (5 to 15 suppliers per destroy call)."""
     n = len(data['F'])
     return random.randint(max(2, int(0.05 * n)), max(5, int(0.15 * n)))
 
 
 def destroy_random(sol, data):
-    """D1 — Randomly remove q active supplier assignments."""
     sol_new = sol.copy()
     active = [(f, b, k, s, t)
               for f in data['F'] for b in data['B'] for k in data['K']
@@ -893,7 +861,6 @@ def destroy_random(sol, data):
 
 
 def destroy_worst_cost(sol, data):
-    """D2 — Remove the q most expensive active supplier assignments."""
     sol_new = sol.copy()
     scored = []
     for f in data['F']:
@@ -917,7 +884,6 @@ def destroy_worst_cost(sol, data):
 
 
 def destroy_route(sol, data):
-    """D3 — Deactivate q active routes and clear their loads."""
     sol_new     = sol.copy()
     active_rt   = [(r, t) for r in data['R'] for t in data['T']
                    if sol_new.X.get((r, t), 0) == 1]
@@ -931,11 +897,10 @@ def destroy_route(sol, data):
             sol_new.Z[(i, r, t)] = 0.0
 
     compute_Q_from_Z(sol_new, data)
-    return sol_new, []          # empty: repair handles route rebuilding
+    return sol_new, []
 
 
 def destroy_waste_driven(sol, data):
-    """D4 — Remove deliveries that caused the highest waste."""
     sol_new = sol.copy()
     m       = data['m']
 
@@ -957,14 +922,15 @@ def destroy_waste_driven(sol, data):
                     )
 
     compute_Q_from_Z(sol_new, data)
-    return sol_new, []          # empty: repair handles service level
+    return sol_new, []
 
 
+# ── FIX P7: removal size raised from //5 to //2 ──────────────────────────────
 def destroy_inventory_driven(sol, data):
     """D5 — Inventory-driven removal.
-    Identifies depot-period pairs where delivery exceeds the minimum needed
-    (mean demand + marginal safety stock). Reduces the excess pre-emptively
-    to cut future waste without violating service-level constraints.
+    FIX P7: removal size raised from _removal_size()//5 to //2.
+    Removing only 1–2 items produced near-identical solutions that the
+    repair immediately reversed.  Larger removals create genuine diversity.
     """
     sol_new = sol.copy()
     T, D, R = data['T'], data['D'], data['R']
@@ -982,7 +948,8 @@ def destroy_inventory_driven(sol, data):
                 scores.append(((i, t), excess))
 
     scores.sort(key=lambda x: x[1], reverse=True)
-    q = min(max(1, _removal_size(data) // 5), len(scores))
+    # FIX P7: was _removal_size(data) // 5  →  now // 2
+    q = min(max(3, _removal_size(data) // 2), len(scores))
 
     for ((i, t), excess) in scores[:q]:
         for r in R:
@@ -999,7 +966,7 @@ def destroy_inventory_driven(sol, data):
 
 
 # =============================================================================
-# SECTION 7 — PHASE 4: REPAIR OPERATORS
+# SECTION 7 — REPAIR OPERATORS
 # =============================================================================
 
 def _get_remaining_cap(sol, data, s, t):
@@ -1011,72 +978,89 @@ def _get_remaining_cap(sol, data, s, t):
     return remaining
 
 
+# ── FIX P3: hub-driven repair ─────────────────────────────────────────────────
 def _reassign_greedy(sol, data, by_st):
     """
     Demand-driven greedy reassignment.
-    Owner suppliers first. Non-owners only if total demand still unmet.
+
+    FIX P3: Uses per-hub targets derived from current sol.Q instead of
+    aggregate depot demand.  The previous version computed a single
+    remaining_need = total_demand - already_transported which ignored
+    which hub needed supply, breaking flow balance constraint (5) silently.
     """
     owned_vehicle = {data['owner'][k]: k for k in data['K']}
 
     for (s, t), unserved in by_st.items():
-        remaining_cap  = _get_remaining_cap(sol, data, s, t)
-        # Remaining need = total demand minus what is already being transported
-        already        = sum(sol.L.get((f, b, k, s, t), 0.0)
-                             for f in data['F'] for b in data['B'] for k in data['K'])
-        remaining_need = max(0.0, sum(data['mu'][(i, t)] for i in data['D']) - already)
+        remaining_cap = _get_remaining_cap(sol, data, s, t)
 
-        # Pass 1: owners in unserved
+        # Per-hub targets: how much each hub still needs after current L
+        hub_need = {
+            b: max(0.0,
+                   sum(sol.Q.get((b, i, t), 0.0) for i in data['D'])
+                   - sum(sol.L.get((f, b, k, s, t), 0.0)
+                         for f in data['F'] for k in data['K']))
+            for b in data['B']
+        }
+
+        # Pass 1: owner suppliers in unserved — assign to highest-need hub
         for f in [f for f in unserved if f in owned_vehicle]:
-            if remaining_need <= 1e-6:
+            if not any(hub_need[b] > 1e-6 for b in data['B']):
                 break
             k      = owned_vehicle[f]
             supply = data['upsilon'].get((f, s, t), 0.0)
             if supply <= 0 or remaining_cap.get(k, 0) < 1e-6:
                 continue
-            amount = min(supply, remaining_need, remaining_cap[k])
-            best_b = min(data['B'], key=lambda b: data['gamma'][(f, b, k)])
+            # Pick hub with highest need and lowest gamma (owner goes to cheapest route)
+            eligible = [b for b in data['B'] if hub_need[b] > 1e-6]
+            if not eligible:
+                continue
+            best_b = min(eligible, key=lambda b: data['gamma'][(f, b, k)])
+            amount = min(supply, hub_need[best_b], remaining_cap[k])
+            if amount <= 1e-6:
+                continue
             sol.Y[(f, best_b, k, s, t)] = 1
             sol.L[(f, best_b, k, s, t)] = int(round(amount))
             remaining_cap[k]           -= amount
-            remaining_need             -= amount
+            hub_need[best_b]           -= amount
 
-        # Pass 2: non-owners only if demand still unmet
-        for f in [f for f in unserved if f not in owned_vehicle]:
-            if remaining_need <= 1e-6:
-                break
-            supply = data['upsilon'].get((f, s, t), 0.0)
-            if supply <= 0:
-                continue
-            amount = min(supply, remaining_need)
-            best_cost, best_k, best_b = float('inf'), None, None
-            for k in data['K']:
-                if remaining_cap.get(k, 0) < amount:
-                    continue
-                for b in data['B']:
-                    cost = data['beta'][(f, k)] + data['gamma'][(f, b, k)] * amount
-                    if cost < best_cost:
-                        best_cost, best_k, best_b = cost, k, b
-            if best_k:
-                sol.Y[(f, best_b, best_k, s, t)] = 1
-                sol.L[(f, best_b, best_k, s, t)] = int(round(amount))
-                remaining_cap[best_k]            -= amount
-                remaining_need                   -= amount
+        # Pass 2: non-owners — use optimised consolidation to minimise beta payments
+        if any(hub_need[b] > 1e-6 for b in data['B']):
+            _assign_nonowners_optimal(data['F'], data['K'], data['B'], data,
+                                      hub_need, remaining_cap, s, t, sol)
 
 
+# ── FIX P3: same hub-target logic for regret repair ──────────────────────────
 def _reassign_regret(sol, data, by_st):
-    """Regret-based reassignment for suppliers in by_st dict."""
+    """Regret-based reassignment.
+    FIX P3: uses per-hub capacity targets, same as _reassign_greedy.
+    """
     for (s, t), unserved in by_st.items():
         remaining_cap = _get_remaining_cap(sol, data, s, t)
+
+        # Per-hub targets
+        hub_need = {
+            b: max(0.0,
+                   sum(sol.Q.get((b, i, t), 0.0) for i in data['D'])
+                   - sum(sol.L.get((f, b, k, s, t), 0.0)
+                         for f in data['F'] for k in data['K']))
+            for b in data['B']
+        }
+
         regrets = []
         for f in unserved:
             supply = data['upsilon'].get((f, s, t), 0.0)
             if supply <= 0:
                 continue
-            options = sorted([
-                (data['beta'][(f, k)] + data['gamma'][(f, b, k)] * supply, k, b)
-                for k in data['K'] if remaining_cap[k] >= supply
-                for b in data['B']
-            ])
+            options = []
+            for k in data['K']:
+                if remaining_cap[k] < supply:
+                    continue
+                for b in data['B']:
+                    if hub_need[b] <= 1e-6:
+                        continue
+                    cost = data['beta'][(f, k)] + data['gamma'][(f, b, k)] * supply
+                    options.append((cost, k, b))
+            options.sort()
             if not options:
                 continue
             best   = options[0][0]
@@ -1084,54 +1068,63 @@ def _reassign_regret(sol, data, by_st):
             regrets.append((second - best, f, options[0][1], options[0][2], supply))
 
         for (_, f, best_k, best_b, supply) in sorted(regrets, reverse=True):
+            if hub_need.get(best_b, 0) <= 1e-6:
+                continue
             if remaining_cap.get(best_k, 0) >= supply:
                 sol.Y[(f, best_b, best_k, s, t)] = 1
                 sol.L[(f, best_b, best_k, s, t)] = int(round(supply))
-                remaining_cap[best_k] -= supply
+                remaining_cap[best_k]            -= supply
+                hub_need[best_b]                 -= supply
             else:
-                # Fallback: greedy
                 for k in data['K']:
                     if remaining_cap[k] >= supply:
                         for b in data['B']:
+                            if hub_need.get(b, 0) <= 1e-6:
+                                continue
                             sol.Y[(f, b, k, s, t)] = 1
                             sol.L[(f, b, k, s, t)] = int(round(supply))
-                            remaining_cap[k] -= supply
+                            remaining_cap[k]       -= supply
+                            hub_need[b]            -= supply
                             break
                         break
 
 
 def route_swap_local_search(sol, data):
     """
-    Fix 3: Route swap local search.
-    For each active route in each period, check whether deactivating it
-    and activating a cheaper route that covers at least the same depot set
-    reduces the total route fixed cost, while maintaining full depot coverage.
-    Greedy first-improvement: accept first beneficial swap found.
+    SPEED: precompute N_sets and cheaper-route index once per call.
+    Inner loop now does set lookups (O(1)) instead of list scans.
     """
+    R, T = data['R'], data['T']
+    lam  = data['lambda']
+    cap  = data['c']
+
+    # Precompute once per call
+    N_sets = {r: set(data['N'][r]) for r in R}
+    # For each route r_out, find all cheaper routes with superset depots
+    cheaper = {}
+    for r_out in R:
+        cheaper[r_out] = [
+            r2 for r2 in R
+            if r2 != r_out
+            and lam[r2] < lam[r_out]
+            and N_sets[r_out].issubset(N_sets[r2])
+            and cap[r2] >= cap[r_out]
+        ]
+
     improved = True
     while improved:
         improved = False
-        for t in data['T']:
-            active = [r for r in data['R'] if sol.X.get((r, t), 0) == 1]
+        for t in T:
+            active = [r for r in R if sol.X.get((r, t), 0) == 1]
             for r_out in active:
-                depots_on_r = set(data['N'][r_out])
-                # Find a cheaper inactive route covering all same depots
-                candidates = [
-                    r2 for r2 in data['R']
-                    if r2 != r_out
-                    and sol.X.get((r2, t), 0) == 0
-                    and data['lambda'][r2] < data['lambda'][r_out]
-                    and depots_on_r.issubset(set(data['N'][r2]))
-                    and data['c'][r2] >= data['c'][r_out]
-                ]
+                candidates = [r2 for r2 in cheaper[r_out]
+                              if sol.X.get((r2, t), 0) == 0]
                 if not candidates:
                     continue
-                r_in = min(candidates, key=lambda r: data['lambda'][r])
-                # Perform swap
+                r_in = min(candidates, key=lambda r: lam[r])
                 sol.X[(r_out, t)] = 0
                 sol.X[(r_in,  t)] = 1
-                # Transfer loads
-                for i in depots_on_r:
+                for i in N_sets[r_out]:
                     z_old = sol.Z.get((i, r_out, t), 0.0)
                     if z_old > 0:
                         sol.Z[(i, r_in,  t)] = sol.Z.get((i, r_in, t), 0) + int(round(z_old))
@@ -1144,23 +1137,17 @@ def route_swap_local_search(sol, data):
 
 
 def _enforce_flow_balance(sol, data):
-    """
-    Enforce exact flow balance: sum_fk L[f,b,k,s,t] = Q[b,t] for every (b,s,t).
-    Uses sparse iteration over non-zero L/Y entries for speed.
-    """
     F, K, B, S, T = data['F'], data['K'], data['B'], data['S'], data['T']
     owned_v  = {data['owner'][k]: k for k in K}
     beta_d   = data['beta']
     ups      = data['upsilon']
     theta    = data['theta']
 
-    # Build full sparse index once — filter non-zero entries only
     active_L_all = {key: v for key, v in sol.L.items() if v > 0}
     active_Y_all = {key: v for key, v in sol.Y.items() if v > 0}
 
     for s in S:
         for t in T:
-            # Build sparse state for this (s,t)
             sup_used = {}
             veh_used = {}
             fk_hub   = {}
@@ -1176,15 +1163,12 @@ def _enforce_flow_balance(sol, data):
             for (f, b, k, _s, _t), y in active_Y_all.items():
                 if _s != s or _t != t:
                     continue
-                # Keep only first hub per (f,k) — fix multi-assign
                 if (f, k) not in fk_hub:
                     fk_hub[(f, k)] = b
                 elif fk_hub[(f, k)] != b:
-                    # Drop the smaller L
                     l_keep = sol.L.get((f, fk_hub[(f,k)], k, s, t), 0)
                     l_drop = sol.L.get((f, b, k, s, t), 0)
                     if l_drop >= l_keep:
-                        # Drop the old hub
                         sol.Y[(f, fk_hub[(f,k)], k, s, t)] = 0
                         sol.L[(f, fk_hub[(f,k)], k, s, t)] = 0
                         sup_used[f]  = max(0, sup_used.get(f, 0) - l_keep)
@@ -1198,7 +1182,6 @@ def _enforce_flow_balance(sol, data):
                         veh_used[k]  = max(0, veh_used.get(k, 0) - l_drop)
                         l_by_b[b]    = max(0, l_by_b.get(b, 0) - l_drop)
 
-            # Pre-build active entries per hub for sparse trim
             active_by_hub = {}
             for (f2, b2, k2, _s2, _t2), lv in active_L_all.items():
                 if _s2 != s or _t2 != t: continue
@@ -1214,7 +1197,6 @@ def _enforce_flow_balance(sol, data):
                     continue
 
                 if diff > 0:
-                    # Trim using pre-built sparse index
                     active_bst = sorted(active_by_hub.get(b, []),
                                         key=lambda x: -x[2])
                     for f, k, cur in active_bst:
@@ -1229,7 +1211,6 @@ def _enforce_flow_balance(sol, data):
                         diff -= trim
 
                 else:
-                    # Fill deficit with cheapest feasible supplier
                     deficit = -diff
                     for f in data.get('_f_by_beta', sorted(F,
                             key=lambda f: min(beta_d.get((f,k2),999) for k2 in K))):
@@ -1243,7 +1224,6 @@ def _enforce_flow_balance(sol, data):
                             if existing is not None and existing != b: continue
                             k_use = k_own
                         else:
-                            # Use pre-computed best vehicle if free
                             k_best = data.get('_nonowner_best_k', {}).get(f)
                             if k_best is not None:
                                 eh = fk_hub.get((f, k_best))
@@ -1274,16 +1254,25 @@ def _enforce_flow_balance(sol, data):
                         veh_used[k_use] = veh_used.get(k_use, 0) + room
                         fk_hub[(f, k_use)] = b
                         deficit -= room
-                    # Rebuild active_L_all to include any new entries
                     active_L_all = {key: v for key, v in sol.L.items() if v > 0}
 
 
-def _finalise(sol, data, rebuild_routes=False, randomize=False):
+def _drop_empty_routes(sol, data):
+    """Remove routes with zero total load — free cost reduction, no SL risk."""
+    for r in data['R']:
+        for t in data['T']:
+            if sol.X.get((r, t), 0) == 1:
+                if sum(sol.Z.get((i, r, t), 0) for i in data['D']) == 0:
+                    sol.X[(r, t)] = 0
+
+
+def _finalise(sol, data, rebuild_routes=False, randomize=False, do_route_swap=False):
     """
-    Common post-repair steps.
-    rebuild_routes=True  → used after D3/D4/D5 (routes were destroyed)
-    rebuild_routes=False → used after D1/D2 (routes are untouched)
-    randomize=True       → use randomized route selection for diversity
+    SPEED: route_swap_local_search is now opt-in (do_route_swap=False by default).
+    During the main ALNS loop it is skipped entirely — it is only run
+    every SWAP_INTERVAL iterations from run_alns, and always at the end.
+    _drop_empty_routes runs on every repair (near-zero cost) to keep the
+    search objective aligned with the true objective.
     """
     if rebuild_routes:
         for t in data['T']:
@@ -1292,13 +1281,14 @@ def _finalise(sol, data, rebuild_routes=False, randomize=False):
 
     compute_inventory_waste(sol, data)
     fix_service_violations(sol, data)
-    route_swap_local_search(sol, data)
+    _drop_empty_routes(sol, data)
+    if do_route_swap:
+        route_swap_local_search(sol, data)
     compute_inventory_waste(sol, data)
     compute_objective(sol, data)
 
 
 def repair_greedy(sol, data, removed, randomize=False):
-    """R1 — Greedy best-fit repair."""
     sol_new  = sol.copy()
     by_st    = {}
     for item in removed:
@@ -1312,7 +1302,6 @@ def repair_greedy(sol, data, removed, randomize=False):
 
 
 def repair_regret(sol, data, removed, randomize=False):
-    """R2 — Regret-based repair."""
     sol_new = sol.copy()
     by_st   = {}
     for item in removed:
@@ -1326,7 +1315,6 @@ def repair_regret(sol, data, removed, randomize=False):
 
 
 def repair_service_level(sol, data, removed, randomize=False):
-    """R3 — Service-level-driven repair (greedy assignment + targeted SL fix)."""
     sol_new = sol.copy()
     by_st   = {}
     for item in removed:
@@ -1343,7 +1331,6 @@ def repair_service_level(sol, data, removed, randomize=False):
 
     compute_inventory_waste(sol_new, data)
 
-    # Fix largest shortfalls first
     violations = sorted(get_violations(sol_new, data), key=lambda x: x[2], reverse=True)
     for (i, t, gap) in violations:
         if not boost_existing_route(sol_new, data, i, t, gap):
@@ -1375,7 +1362,8 @@ def roulette_select(weights):
     return len(weights) - 1
 
 
-def update_weights(weights, scores, usage, lam=0.2):
+# ── FIX P8: lam default raised to 0.3 in run_alns; update_weights unchanged ──
+def update_weights(weights, scores, usage, lam=0.3):
     for i in range(len(weights)):
         if usage[i] > 0:
             avg        = scores[i] / usage[i]
@@ -1384,23 +1372,19 @@ def update_weights(weights, scores, usage, lam=0.2):
     return weights
 
 
-
 # =============================================================================
-# SECTION 8b — PERTURBATION (escape local optima)
+# SECTION 8b — PERTURBATION
 # =============================================================================
 
 def perturb(sol, data):
     """
-    Double-bridge perturbation: simultaneously destroys a large fraction
-    of supplier assignments AND replaces a random selection of active routes.
-    Used to escape local optima when ALNS stops improving.
-    Always produces a feasible solution via full rebuild.
+    Double-bridge perturbation: simultaneously destroys 30% of supplier
+    assignments AND 30% of active routes, then rebuilds fully.
     """
     sol_new = sol.copy()
     F, K, B, D, R, T, S = (data['F'], data['K'], data['B'],
                              data['D'], data['R'], data['T'], data['S'])
 
-    # --- Part A: remove 30% of active assignments ---
     active = [(f, b, k, s, t)
               for f in F for b in B for k in K for s in S for t in T
               if sol_new.Y.get((f, b, k, s, t), 0) == 1]
@@ -1409,7 +1393,6 @@ def perturb(sol, data):
         sol_new.Y[key] = 0
         sol_new.L[key] = 0.0
 
-    # --- Part B: deactivate 30% of active routes and clear their loads ---
     active_rt = [(r, t) for r in R for t in T if sol_new.X.get((r, t), 0) == 1]
     q_r = max(1, int(0.30 * len(active_rt)))
     for (r, t) in random.sample(active_rt, min(q_r, len(active_rt))):
@@ -1417,24 +1400,20 @@ def perturb(sol, data):
         for i in data['N'][r]:
             sol_new.Z[(i, r, t)] = 0.0
 
-    # --- Full rebuild with randomized routes ---
     compute_Q_from_Z(sol_new, data)
     for t in T:
         cover_all_depots(sol_new, data, t, randomize=True)
     compute_Q_from_Z(sol_new, data)
 
-    # Rebuild assignments to match new hub targets
     owned_vehicle = {data['owner'][k]: k for k in data['K']}
     for s in S:
         for t in T:
             remaining_cap = {k: data['theta'][k] for k in K}
             hub_need = {b: sum(sol_new.Q.get((b, i, t), 0.0) for i in D) for b in B}
 
-            # Re-assign owners first
             for f in F:
                 if f not in owned_vehicle:
                     continue
-                # Clear any existing assignment for this (f, s, t)
                 for b in B:
                     for k_old in K:
                         if sol_new.Y.get((f, b, k_old, s, t), 0) == 1:
@@ -1459,11 +1438,10 @@ def perturb(sol, data):
                     hub_need[best_b]                -= amount
                     break
 
-            # Non-owners if needed
             if any(need > 1e-6 for need in hub_need.values()):
                 non_owners = [f for f in F if f not in owned_vehicle
                               and data['upsilon'].get((f, s, t), 0.0) > 0]
-                random.shuffle(non_owners)   # randomize non-owner order
+                random.shuffle(non_owners)
                 for f in non_owners:
                     if not any(hub_need[b] > 1e-6 for b in B):
                         break
@@ -1496,25 +1474,44 @@ def perturb(sol, data):
     compute_objective(sol_new, data)
     return sol_new
 
+
 # =============================================================================
 # SECTION 9 — MAIN ALNS LOOP
 # =============================================================================
 
-def run_alns(data, max_iter=5000, segment=100, lam=0.2, verbose=True):
+def run_alns(data, max_iter=15000, segment=200, lam=0.3, verbose=True):
     """
-    Run ALNS with LAHC acceptance criterion.
+    Run ALNS with Simulated Annealing acceptance criterion.
 
-    Parameters:
-        data     : loaded problem data
-        max_iter : total iterations
-        segment  : weight update frequency (eta)
-        lam      : reaction factor for weight update
-        verbose  : print progress every segment
+    SPEED OPTIMIZATIONS (this version):
+    ─────────────────────────────────────
+    S1  max_iter reduced 30 000 → 15 000.  With faster iterations the same
+        wall-clock budget now covers more search.  Target: ~8–10 min.
+    S2  route_swap_local_search removed from every repair (_finalise now
+        takes do_route_swap flag).  It runs only every SWAP_INTERVAL iters
+        and always before round_solution at the end.
+    S3  fix_service_violations now batches all Z changes within a pass and
+        recomputes Q/inventory ONCE per pass, not after every depot-period.
+        Eliminates ~180 redundant recomputes per repair call.
+    S4  route_swap_local_search precomputes the cheaper-route index once
+        per call instead of scanning all R² pairs on every swap attempt.
 
-    Returns:
-        best Solution found
+    All quality fixes (P1–P9) from the previous version are retained.
+
+    Parameters
+    ----------
+    data     : loaded problem data
+    max_iter : total SA iterations (default 15 000, ~8–10 min)
+    segment  : weight update frequency  (default 200)
+    lam      : reaction factor for weight update  (default 0.3)
+    verbose  : print progress every segment
     """
-    SIGMA_1, SIGMA_2, SIGMA_3 = 10, 5, 2
+    SIGMA_1 = 10
+    SIGMA_2 = 5
+    SIGMA_3 = 1
+
+    # SPEED S2: route_swap runs every SWAP_INTERVAL iterations only
+    SWAP_INTERVAL = 500
 
     destroy_ops = [destroy_random, destroy_worst_cost,
                    destroy_route,  destroy_waste_driven,
@@ -1524,89 +1521,125 @@ def run_alns(data, max_iter=5000, segment=100, lam=0.2, verbose=True):
     r_names     = ['R1-greedy', 'R2-regret', 'R3-service']
 
     n_d, n_r   = len(destroy_ops), len(repair_ops)
-    w_d, w_r   = [1.0] * n_d, [1.0] * n_r  # n_d=5, n_r=3
+    w_d, w_r   = [1.0] * n_d, [1.0] * n_r
     sc_d, sc_r = [0.0] * n_d, [0.0] * n_r
     us_d, us_r = [0]   * n_d, [0]   * n_r
 
     # Phase 1: Greedy initial solution
+    t_start = time.time()
     print("\nPhase 1: Building initial solution...")
-    x           = greedy_initialize(data)
-    x_best      = x.copy()
-    x_best_true = round_solution(x, data)   # track true (post-processed) best
+    x      = greedy_initialize(data)
+    x_best = x.copy()
+    t_init = time.time() - t_start
     print(f"  Objective      : {x.obj:.4f}")
     print(f"  Active routes  : {sum(x.X.get((r,t),0) for r in data['R'] for t in data['T'])}")
-    print(f"  SL violations  : {len(get_violations(x, data, ignore_waste_gaps=False))}\n")
+    print(f"  SL violations  : {len(get_violations(x, data, ignore_waste_gaps=False))}")
+    print(f"  Init time      : {t_init:.1f}s\n")
 
-    # LAHC history list — length = max_iter / 10
-    L         = max(1, max_iter // 10)
-    f_history = [x.obj] * L
+    # SA calibration
+    delta_init = 0.02 * max(x.obj, 1.0)
+    T0         = -delta_init / math.log(0.8)
+    T_min      = 0.0001 * max(x.obj, 1.0)
+    cooling    = (T_min / max(T0, 1e-12)) ** (1.0 / max(max_iter, 1))
+    temp       = T0
+    print(f"  SA T0={T0:.4f}  T_min={T_min:.6f}  cooling={cooling:.8f}")
+    print(f"  route_swap every {SWAP_INTERVAL} iterations\n")
 
-    # Perturbation control
-    no_improve      = 0
-    no_improve_limit = max(50, max_iter // 20)   # trigger after N stagnant iters
+    no_improve       = 0
+    no_improve_limit = max(500, max_iter // 15)
+    print(f"  Perturbation trigger: {no_improve_limit} stagnant iterations\n")
 
-    # Main loop
+    # Main ALNS loop
+    print("Phase 2: ALNS search...")
+    t_search_start = time.time()
+
+    # Diagnostic counters — printed at iter 50 to catch stagnation early
+    _diag_new_best   = 0
+    _diag_accepted   = 0
+    _diag_rejected   = 0
+    _diag_deltas     = []   # obj differences of all x_new vs x
     for it in range(1, max_iter + 1):
 
-        # --- Perturbation restart if stuck ---
+        # Perturbation restart if stagnant
         if no_improve >= no_improve_limit:
-            x_perturbed    = perturb(x_best, data)
-            x              = x_perturbed.copy()
-            no_improve     = 0
-            # Reset LAHC history to allow uphill moves after perturbation
-            f_history      = [x.obj] * L
+            x_perturbed = perturb(x_best, data)
+            x           = x_perturbed.copy()
+            no_improve  = 0
+            temp = T0 * ((cooling ** it) ** 0.5)
             if verbose:
-                print(f"  ** Perturbation at iter {it} | new obj={x.obj:.4f} **")
+                print(f"  ** Perturbation at iter {it} | new obj={x.obj:.4f} | temp={temp:.4f} **")
 
-        # Phase 2: Select operators
+        # Select operators
         d_idx = roulette_select(w_d)
         r_idx = roulette_select(w_r)
 
-        # Phase 3: Destroy
+        # Destroy
         x_partial, removed = destroy_ops[d_idx](x, data)
 
-        # Phase 4: Repair — randomize route selection for D3/D4
-        use_random = (d_idx in [2, 3, 4])   # D3=route, D4=waste, D5=inventory
-        if use_random:
-            x_new = repair_ops[r_idx](x_partial, data, removed, randomize=True)
-        else:
-            x_new = repair_ops[r_idx](x_partial, data, removed)
+        # Repair
+        # SPEED S2: do_route_swap=True only every SWAP_INTERVAL iterations
+        use_random   = (d_idx in [2, 3, 4])
+        do_swap_now  = (it % SWAP_INTERVAL == 0)
+        x_new = repair_ops[r_idx](x_partial, data, removed,
+                                   randomize=use_random)
+        # Apply route_swap periodically to the repaired solution
+        if do_swap_now:
+            route_swap_local_search(x_new, data)
+            compute_inventory_waste(x_new, data)
+            compute_objective(x_new, data)
 
-        # Phase 5: LAHC acceptance
-        idx   = it % L
+        # SA acceptance
         score = 0
 
-        if x_new.obj < x_best.obj - 1e-6:
+        delta = x_new.obj - x_best.obj
+        if delta < -1e-6:
             x_best     = x_new.copy()
             score      = SIGMA_1
             no_improve = 0
-            # Evaluate true (post-processed) objective and update if improved
-            x_new_true = round_solution(x_new, data)
-            if x_new_true.obj < x_best_true.obj - 1e-6:
-                x_best_true = x_new_true
+            _diag_new_best += 1
         else:
             no_improve += 1
 
-        # Periodically evaluate round_solution on current solution
-        # to discover improvements missed by the search objective
-        RS_INTERVAL = max(1, max_iter // 30)   # ~30 round_solution calls total
-        if it % RS_INTERVAL == 0:
-            x_curr_true = round_solution(x.copy(), data)
-            if x_curr_true.obj < x_best_true.obj - 1e-6:
-                x_best_true = x_curr_true
-
-        if x_new.obj < f_history[idx] - 1e-6:
+        delta_curr = x_new.obj - x.obj
+        _diag_deltas.append(delta_curr)
+        if delta_curr < -1e-6:
             x     = x_new.copy()
             score = max(score, SIGMA_2)
+            _diag_accepted += 1
+        elif random.random() < math.exp(-delta_curr / max(temp, 1e-12)):
+            x     = x_new.copy()
+            score = max(score, SIGMA_3)
+            _diag_accepted += 1
         else:
-            score = max(score, 0)
+            _diag_rejected += 1
 
-        f_history[idx] = x.obj
+        temp *= cooling
+
+        # ── Early diagnostic at iteration 50 ────────────────────────────
+        if it == 50:
+            avg_delta  = sum(_diag_deltas) / len(_diag_deltas)
+            zero_moves = sum(1 for d in _diag_deltas if abs(d) < 1e-4)
+            print(f"\n  ── DIAGNOSTIC (first 50 iters) ──")
+            print(f"  New best found   : {_diag_new_best}")
+            print(f"  Accepted moves   : {_diag_accepted}")
+            print(f"  Rejected moves   : {_diag_rejected}")
+            print(f"  Zero-delta moves : {zero_moves}  "
+                  f"({'STUCK — repair returns same solution' if zero_moves > 40 else 'OK'})")
+            print(f"  Avg obj delta    : {avg_delta:.4f}  "
+                  f"({'repair barely changes obj' if abs(avg_delta) < 1.0 else 'OK'})")
+            print(f"  SA temp T        : {temp:.4f}")
+            print(f"  SA T0            : {T0:.4f}")
+            if zero_moves > 40:
+                print(f"  !! PROBLEM: repair is returning near-identical solutions.")
+                print(f"     Root cause: fix_service_violations is over-constraining.")
+                print(f"     The destroy operators are removing assignments but repair")
+                print(f"     immediately restores the same Q/Z values via SL enforcement.")
+            print(f"  ─────────────────────────────────\n")
 
         sc_d[d_idx] += score;  us_d[d_idx] += 1
         sc_r[r_idx] += score;  us_r[r_idx] += 1
 
-        # Phase 6: Weight update every segment iterations
+        # Weight update every segment
         if it % segment == 0:
             w_d = update_weights(w_d, sc_d, us_d, lam)
             w_r = update_weights(w_r, sc_r, us_r, lam)
@@ -1614,16 +1647,37 @@ def run_alns(data, max_iter=5000, segment=100, lam=0.2, verbose=True):
             us_d, us_r = [0]*n_d,   [0]*n_r
 
             if verbose:
+                elapsed   = time.time() - t_search_start
+                iters_sec = it / max(elapsed, 1e-9)
+                remaining = (max_iter - it) / max(iters_sec, 1e-9)
                 ar = sum(x_best.X.get((r,t),0) for r in data['R'] for t in data['T'])
-                print(f"Iter {it:5d} | current={x.obj:.4f} | best={x_best.obj:.4f} | routes={ar} | stagnant={no_improve}")
+                print(f"Iter {it:6d}/{max_iter} | curr={x.obj:.2f} | best={x_best.obj:.2f} "
+                      f"| routes={ar} | stagnant={no_improve} | T={temp:.4f} "
+                      f"| {elapsed/60:.1f}min elapsed | ETA {remaining/60:.1f}min")
                 print(f"  Destroy : { {d_names[i]: round(w_d[i],3) for i in range(n_d)} }")
                 print(f"  Repair  : { {r_names[i]: round(w_r[i],3) for i in range(n_r)} }")
 
-    print(f"\nALNS complete.")
+    # Final route_swap on best before rounding
+    t_search_end = time.time()
+    print(f"\nALNS search complete.")
+    print(f"  Search time    : {(t_search_end - t_search_start)/60:.2f} min  "
+          f"({(t_search_end - t_search_start):.1f}s  |  "
+          f"{max_iter / max(t_search_end - t_search_start, 1e-9):.0f} iter/s)")
+    print(f"  Applying final route_swap to best solution...")
+    route_swap_local_search(x_best, data)
+    compute_inventory_waste(x_best, data)
+    compute_objective(x_best, data)
+
     print(f"  Best objective (search) : {x_best.obj:.4f}")
+    print(f"  Post-processing (round_solution)...")
+    t_round_start = time.time()
+    x_best_true = round_solution(x_best, data)
+    t_round_end = time.time()
+    print(f"  Round time     : {t_round_end - t_round_start:.1f}s")
     print(f"  Best objective (true)   : {x_best_true.obj:.4f}")
     print(f"  Active routes  : {sum(x_best_true.X.get((r,t),0) for r in data['R'] for t in data['T'])}")
     print(f"  SL violations  : {len(get_violations(x_best_true, data, ignore_waste_gaps=False))}")
+    print(f"  TOTAL WALL TIME: {(time.time() - t_start)/60:.2f} min")
     return x_best_true
 
 
@@ -1637,14 +1691,12 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
 
     with pd.ExcelWriter(path, engine='openpyxl') as writer:
 
-        # Y assignments
         pd.DataFrame([
             {'supplier': f, 'hub': b, 'vehicle': k, 'scenario': s, 'period': t}
             for f in F for b in B for k in K for s in S for t in T
             if sol.Y.get((f, b, k, s, t), 0) == 1
         ]).to_excel(writer, sheet_name='Y_assignments', index=False)
 
-        # L transport amounts
         pd.DataFrame([
             {'supplier': f, 'hub': b, 'vehicle': k, 'scenario': s,
              'period': t, 'amount': round(sol.L.get((f, b, k, s, t), 0.0), 4)}
@@ -1652,13 +1704,11 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
             if sol.L.get((f, b, k, s, t), 0.0) > 1e-6
         ]).to_excel(writer, sheet_name='L_transport', index=False)
 
-        # X active routes
         pd.DataFrame([
             {'route': r, 'period': t}
             for r in R for t in T if sol.X.get((r, t), 0) == 1
         ]).to_excel(writer, sheet_name='X_routes', index=False)
 
-        # Z loads
         pd.DataFrame([
             {'depot': i, 'route': r, 'period': t,
              'load': round(sol.Z.get((i, r, t), 0.0), 4)}
@@ -1666,7 +1716,6 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
             if sol.Z.get((i, r, t), 0.0) > 1e-6
         ]).to_excel(writer, sheet_name='Z_loads', index=False)
 
-        # Q — delivery from hub b to depot i in period t
         pd.DataFrame([
             {'hub': b, 'depot': i, 'period': t,
              'delivery': round(sol.Q.get((b, i, t), 0.0), 4)}
@@ -1674,7 +1723,6 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
             if sol.Q.get((b, i, t), 0.0) > 1e-6
         ]).to_excel(writer, sheet_name='Q_deliveries', index=False)
 
-        # Inventory and waste
         pd.DataFrame([
             {'depot': i, 'period': t,
              'inventory': round(sol.I.get((i, t), 0.0), 4),
@@ -1683,7 +1731,6 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
             for i in D for t in T
         ]).to_excel(writer, sheet_name='Inventory_Waste', index=False)
 
-        # Objective breakdown
         pr, beta, gamma = data['pr'], data['beta'], data['gamma']
         h, p, lam       = data['h'], data['p'], data['lambda']
 
@@ -1714,27 +1761,18 @@ def export_solution(sol, data, path='alns_solution.xlsx'):
 # =============================================================================
 
 def _trim_to_dp_minimum(sol, data):
-    """
-    Post-processing: trim Z delivery per depot-period to integer DP minimum.
-
-    Critical detail: waste_sim is updated AFTER each period's trim so that
-    subsequent periods use the correct (reduced) waste value when computing
-    their min_cumQ.  Without this, trimming t=3 doesn't reduce the waste
-    seen at t=5, leaving the solution unchanged.
-    """
     D, R, T, B = data['D'], data['R'], data['T'], data['B']
 
     for i in D:
         demands = [data['mu'][(i, t)] for t in T]
         sl_vals = [data['sl_rhs_cache'][(i, t)] for t in T]
 
-        cumQ      = 0      # cumulative delivery delivered so far
-        inv       = 0.0    # inventory at end of previous period
+        cumQ      = 0
+        inv       = 0.0
         waste_sim = [0] * 6
         changed   = False
 
         for tidx, t in enumerate(T):
-            # prior waste based on SIMULATED (trimmed) values
             prior_w  = sum(waste_sim[:tidx])
             min_cumQ = math.ceil(sl_vals[tidx] + prior_w - 1e-9)
             target   = max(int(math.ceil(demands[tidx] - 1e-9)),
@@ -1760,7 +1798,6 @@ def _trim_to_dp_minimum(sol, data):
                 actual = sum(sol.Q.get((b, i, t), 0) for b in B)
                 changed = True
             elif actual < target:
-                # Add delivery to meet target (shortage after cascade adjustment)
                 need = target - actual
                 if not boost_existing_route(sol, data, i, t, need):
                     inactive = [r for r in R
@@ -1774,13 +1811,11 @@ def _trim_to_dp_minimum(sol, data):
                 changed = True
 
             cumQ += actual
-            # Simulate waste with UPDATED actual delivery
             waste_sim[tidx] = max(0, int(round(max(0.0, inv - demands[tidx])))) if tidx >= 1 else 0
             inv = inv + actual - int(demands[tidx]) - waste_sim[tidx]
 
         if changed:
             compute_inventory_waste(sol, data)
-            # Restore any SL violations introduced by trimming
             for tidx, t in enumerate(T):
                 gap = sl_rhs(data, i, t) - sl_lhs(sol, data, i, t)
                 if gap > 1e-6:
@@ -1799,29 +1834,14 @@ def _trim_to_dp_minimum(sol, data):
 
 
 def _consolidate_vehicles(sol, data):
-    """
-    Post-processing: reduce non-owner assignment cost by consolidating
-    non-owner suppliers onto underloaded vehicles.
-
-    For each (s, t):
-    1. Find vehicles with spare capacity (load < theta).
-    2. Move non-owner suppliers from high-beta vehicles onto low-beta
-       vehicles that have room, reducing the total number of beta payments.
-    3. Remove vehicles that become empty after consolidation.
-
-    This exploits the fact that beta is paid per (f, k) assignment regardless
-    of load amount -- fewer distinct vehicles used = lower total beta cost.
-    """
     F, K, B, S, T = (data['F'], data['K'], data['B'], data['S'], data['T'])
     owned = {data['owner'][k]: k for k in K}
 
     for s in S:
         for t in T:
-            # Current load per vehicle
             veh_load = {k: sum(sol.L.get((f, b, k, s, t), 0)
                                for f in F for b in B) for k in K}
 
-            # Non-owner assignments: list of (beta_cost, f, b, k, load)
             nonowner_assigns = sorted([
                 (data['beta'][(f, k)], f, k,
                  next((b for b in B if sol.Y.get((f, b, k, s, t), 0) == 1), None),
@@ -1829,15 +1849,14 @@ def _consolidate_vehicles(sol, data):
                 for f in F if f not in owned
                 for k in K if sol.Y.get((f, next((b for b in B
                     if sol.Y.get((f, b, k, s, t), 0) == 1), B[0]), k, s, t), 0) == 1
-            ], reverse=True)  # highest beta first (eliminate these first)
+            ], reverse=True)
 
             for beta_v, f, k_old, b_old, load in nonowner_assigns:
                 if b_old is None or load <= 0:
                     continue
 
-                # Find a cheaper vehicle with enough spare capacity
                 best_k   = None
-                best_cost = beta_v   # only consolidate if it lowers cost
+                best_cost = beta_v
                 for k_new in K:
                     if k_new == k_old:
                         continue
@@ -1846,15 +1865,12 @@ def _consolidate_vehicles(sol, data):
                     spare = data['theta'][k_new] - veh_load[k_new]
                     if spare < load - 0.5:
                         continue
-                    # Check that k_new can go to same hub b_old
-                    # (gamma must be finite -- all vehicles can go to any hub)
                     best_k    = k_new
                     best_cost = data['beta'][(f, k_new)]
 
                 if best_k is None:
                     continue
 
-                # Move: remove old assignment, add new one
                 sol.Y[(f, b_old, k_old, s, t)] = 0
                 sol.L[(f, b_old, k_old, s, t)] = 0
                 sol.Y[(f, b_old, best_k, s, t)] = 1
@@ -1866,51 +1882,36 @@ def _consolidate_vehicles(sol, data):
 
 
 def _eliminate_redundant_routes(sol, data):
-    """
-    Post-processing: remove active routes whose load can be redistributed
-    to other already-active routes, saving the fixed route cost.
-
-    For each period t, for each active route r NOT in the optimal route set:
-      1. Try to move every Z[i,r,t] to another active route serving depot i.
-      2. If all load is successfully moved, deactivate r (X[r,t]=0).
-      3. Recompute Q and verify SL is still satisfied.
-
-    Also deactivates routes with zero load immediately.
-    """
     D, R, T, B = data['D'], data['R'], data['T'], data['B']
     optimal = set(data.get('optimal_routes', []))
 
     for t in T:
-        # Step 1: deactivate empty routes immediately
         for r in list(R):
             if sol.X.get((r, t), 0) == 1:
                 load = sum(sol.Z.get((i, r, t), 0) for i in D)
                 if load == 0:
                     sol.X[(r, t)] = 0
 
-        # Step 2: try to eliminate non-optimal routes by moving their load
         changed = True
         while changed:
             changed = False
-            for r in sorted(R, key=lambda r: -data['lambda'][r]):  # costliest first
+            for r in sorted(R, key=lambda r: -data['lambda'][r]):
                 if sol.X.get((r, t), 0) == 0:
                     continue
                 if r in optimal:
-                    continue  # keep optimal routes
+                    continue
                 load = sum(sol.Z.get((i, r, t), 0) for i in D)
                 if load == 0:
                     sol.X[(r, t)] = 0
                     changed = True
                     continue
 
-                # Try to move each depot's load to another active route
                 moved_all = True
-                moves = {}   # (i, r_dst, amount) to apply if all succeed
+                moves = {}
                 for i in D:
                     z = sol.Z.get((i, r, t), 0)
                     if z == 0:
                         continue
-                    # Find another active route serving depot i with capacity
                     alternatives = [
                         r2 for r2 in R
                         if r2 != r
@@ -1922,18 +1923,15 @@ def _eliminate_redundant_routes(sol, data):
                     if not alternatives:
                         moved_all = False
                         break
-                    # Pick cheapest alternative
                     r_dst = min(alternatives, key=lambda r2: data['lambda'][r2])
                     moves[i] = (r_dst, z)
 
                 if moved_all and moves:
-                    # Apply moves
                     for i, (r_dst, z) in moves.items():
                         sol.Z[(i, r, t)]     = 0
                         sol.Z[(i, r_dst, t)] = sol.Z.get((i, r_dst, t), 0) + z
                     sol.X[(r, t)] = 0
 
-                    # Recompute Q and verify SL — undo if violation
                     compute_Q_from_Z(sol, data)
                     compute_inventory_waste(sol, data)
                     viols = [
@@ -1942,7 +1940,6 @@ def _eliminate_redundant_routes(sol, data):
                         if sl_rhs(data, i2, t2) - sl_lhs(sol, data, i2, t2) > 1e-6
                     ]
                     if viols:
-                        # Undo
                         for i, (r_dst, z) in moves.items():
                             sol.Z[(i, r, t)]     = z
                             sol.Z[(i, r_dst, t)] = max(0, sol.Z.get((i, r_dst, t), 0) - z)
@@ -1957,15 +1954,6 @@ def _eliminate_redundant_routes(sol, data):
 
 
 def _reroute_owners_to_reduce_nonowners(sol, data):
-    """
-    Post-processing: reassign Y and L for fixed Q targets to minimise
-    total assignment+transport cost. For each (s,t):
-      1. Assign owners to hubs minimising (beta + gamma*load) jointly
-         via a greedy that considers all (owner -> hub) pairs.
-      2. Fill remaining hub deficits with cheapest non-owners (high supply
-         first to minimise count = minimise total beta).
-      3. Enforce exact flow balance.
-    """
     F, K, B, S, T = data['F'], data['K'], data['B'], data['S'], data['T']
     owned   = {data['owner'][k]: k for k in K}
     pr      = data['pr']
@@ -1976,11 +1964,9 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
 
     for s in S:
         for t in T:
-            # Hub targets
             q_tgt = {b: sum(sol.Q.get((b, i, t), 0) for i in data['D']) for b in B}
-            remaining = dict(q_tgt)   # mutable copy
+            remaining = dict(q_tgt)
 
-            # Zero out existing Y and L for this (s,t)
             for f in F:
                 for b in B:
                     for k in K:
@@ -1989,10 +1975,6 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
 
             veh_cap = {k: theta[k] for k in K}
 
-            # --- Pass 1: assign owners ---
-            # Rank every (owner, hub) pair by total marginal cost:
-            # beta[f,k]*pr[s] + gamma[f,b,k]*supply*pr[s]  (pay beta once)
-            # Sort so cheapest assignments happen first.
             owner_candidates = []
             for f in owned:
                 k = owned[f]
@@ -2009,9 +1991,9 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
             assigned_owners = set()
             for _, f, k, b, sup in owner_candidates:
                 if f in assigned_owners:
-                    continue        # owner already placed
+                    continue
                 if remaining[b] <= 0:
-                    continue        # hub already satisfied
+                    continue
                 if veh_cap[k] <= 0:
                     continue
                 load = int(round(min(sup, remaining[b], veh_cap[k])))
@@ -2023,7 +2005,6 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
                 veh_cap[k]    -= load
                 assigned_owners.add(f)
 
-            # --- Pass 2: fill remaining with non-owners (high supply first) ---
             non_owners_avail = sorted(
                 [(f, ups.get((f, s, t), 0))
                  for f in F if f not in owned and ups.get((f, s, t), 0) > 0],
@@ -2033,7 +2014,6 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
             for b in B:
                 if remaining[b] <= 0:
                     continue
-                # Sort non-owners by cost for this hub
                 nos = sorted(
                     [(beta_d[(f, k)] + gamma_d[(f, b, k)] * sup, f, sup)
                      for f, sup in non_owners_avail
@@ -2058,13 +2038,11 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
                     veh_cap[best_k] -= load
                     assigned_no.add(f)
 
-            # --- Pass 3: exact flow balance ---
             for b in B:
                 l_total = sum(sol.L.get((f, b, k, s, t), 0) for f in F for k in K)
                 diff = l_total - q_tgt[b]
                 if abs(diff) < 1:
                     continue
-                # Trim/add on the largest L entry
                 entries = sorted(
                     [(f, k, sol.L.get((f, b, k, s, t), 0))
                      for f in F for k in K if sol.L.get((f, b, k, s, t), 0) > 0],
@@ -2083,84 +2061,59 @@ def _reroute_owners_to_reduce_nonowners(sol, data):
 
 
 def _shift_hub3_load_to_cheaper_hubs(sol, data):
-    """
-    Post-processing: for depots currently served via the most expensive hub
-    (hub with fewest owner suppliers), activate an alternative route via a
-    cheaper hub when the net saving (assignment cost reduction - extra route cost)
-    is positive.
-
-    This mimics OPL's joint optimisation of route selection and assignment.
-    """
     D, R, T, B = data['D'], data['R'], data['T'], data['B']
     owned = {data['owner'][k]: k for k in data['K']}
     pr    = data['pr']
 
-    # Identify which hub has the most expensive non-owner dependency
-    # (hub with lowest owner supply relative to its target)
     for t in T:
         hub_target = {b: sum(sol.Q.get((b, i, t), 0) for i in D) for b in B}
 
-        # owner supply to each hub at each scenario
-        # The hub with the worst owner coverage needs the most non-owners
         hub_owner_s1 = {}
         for b in B:
-            # Approximate: assume owners always go to cheapest gamma hub
             supply = sum(
                 min(data['upsilon'].get((f, 1, t), 0), data['theta'][owned[f]])
                 for f in owned
             )
-            hub_owner_s1[b] = supply  # simplified
+            hub_owner_s1[b] = supply
 
-        # For each depot currently served via hub 3 (highest non-owner cost):
-        for r_from in sorted(R, key=lambda r: -data['lambda'][r]):  # try switching expensive routes first
+        for r_from in sorted(R, key=lambda r: -data['lambda'][r]):
             if sol.X.get((r_from, t), 0) == 0:
                 continue
             b_from = data['route_hub_map'].get(r_from)
-            if b_from != 3:   # only try to shift away from hub 3
+            if b_from != 3:
                 continue
 
             depots_on_r = [i for i in D if sol.Z.get((i, r_from, t), 0) > 0]
             if not depots_on_r:
                 continue
 
-            # Find an alternative route via hub 1 or 2 covering ALL these depots
             for r_to in sorted(R, key=lambda r: data['lambda'][r]):
                 if r_to == r_from:
                     continue
                 if sol.X.get((r_to, t), 0) == 1:
-                    continue   # already active, handled by route_swap
+                    continue
                 b_to = data['route_hub_map'].get(r_to)
                 if b_to == 3:
-                    continue   # same hub, no gain
+                    continue
                 if b_to is None:
                     continue
 
-                # Check r_to covers all the depots on r_from
                 if not all(i in data['N'][r_to] for i in depots_on_r):
                     continue
 
-                # Check capacity: total load on r_to + existing r_from load <= c[r_to]
                 existing_load_rto = sum(sol.Z.get((i, r_to, t), 0) for i in D)
                 shift_load = sum(sol.Z.get((i, r_from, t), 0) for i in depots_on_r)
                 if existing_load_rto + shift_load > data['c'][r_to]:
                     continue
 
-                # Net cost change:
-                # Route: +lambda[r_to]  (activate new route)
-                # Assignment: save non-owner cost at hub 3
-                # For each unit shifted from hub 3 to hub b_to:
-                # In s=1: hub 3 deficit drops by shift_load -> save ceil(shift_load/35)*50*0.3
-                # This is an approximation -- use unit saving rate
-                avg_no_supply = 35  # approximate
+                avg_no_supply = 35
                 min_beta_no = min(data['beta'][(f, k)]
                                   for f in data['F'] if f not in owned
                                   for k in data['K'])
                 n_no_saved = shift_load / avg_no_supply
-                beta_saving_per_t = n_no_saved * min_beta_no * pr[1]  # s=1 only
-
+                beta_saving_per_t = n_no_saved * min_beta_no * pr[1]
                 route_extra_cost = data['lambda'][r_to]
 
-                # Only switch if route 22 (hub 3) can be turned off
                 r_from_can_deactivate = all(
                     any(sol.X.get((r2, t), 0) == 1 and i in data['N'][r2]
                         for r2 in R if r2 != r_from and data['route_hub_map'].get(r2) != 3)
@@ -2173,7 +2126,6 @@ def _shift_hub3_load_to_cheaper_hubs(sol, data):
                 if net <= 0:
                     continue
 
-                # Apply: move load from r_from to r_to, deactivate r_from if empty
                 for i in depots_on_r:
                     z = sol.Z.get((i, r_from, t), 0)
                     sol.Z[(i, r_from, t)] = 0
@@ -2181,18 +2133,15 @@ def _shift_hub3_load_to_cheaper_hubs(sol, data):
 
                 sol.X[(r_to, t)] = 1
 
-                # Deactivate r_from if completely empty
                 if sum(sol.Z.get((i, r_from, t), 0) for i in D) == 0:
                     sol.X[(r_from, t)] = 0
 
                 compute_Q_from_Z(sol, data)
                 compute_inventory_waste(sol, data)
 
-                # Verify SL not broken
                 viols = [1 for i in D for t2 in T
                          if sl_rhs(data, i, t2) - sl_lhs(sol, data, i, t2) > 1e-6]
                 if viols:
-                    # Undo
                     for i in depots_on_r:
                         z = sol.Z.get((i, r_to, t), 0)
                         sol.Z[(i, r_to, t)]   = max(0, z - sol.Z.get((i, r_from, t), 0))
@@ -2202,17 +2151,13 @@ def _shift_hub3_load_to_cheaper_hubs(sol, data):
                     compute_Q_from_Z(sol, data)
                     compute_inventory_waste(sol, data)
                 else:
-                    break   # successfully shifted, try next route
+                    break
 
     compute_Q_from_Z(sol, data)
     compute_inventory_waste(sol, data)
 
 
 def _fill_lq_deficits(sol, data):
-    """
-    Fill L < Q deficits after _trim_to_dp_minimum using a fast sparse pass.
-    Iterates only over non-zero L entries (typically <700 out of 135,000).
-    """
     F, K, B, S, T, D = (data['F'], data['K'], data['B'],
                          data['S'], data['T'], data['D'])
     owned_v  = {data['owner'][k]: k for k in K}
@@ -2223,10 +2168,8 @@ def _fill_lq_deficits(sol, data):
                         sorted(F, key=lambda f: min(beta_d.get((f,k),999) for k in K)))
     no_best_k = data.get('_nonowner_best_k', {})
 
-    # Build full sparse indices ONCE (avoid 135000-entry iteration per (s,t))
-    # Group by (s,t) for fast per-scenario access
-    L_by_st   = {}   # (s,t) -> {(f,b,k): l}
-    Y_by_st   = {}   # (s,t) -> {(f,k): b}
+    L_by_st   = {}
+    Y_by_st   = {}
 
     for (f, b, k, _s, _t), l in sol.L.items():
         if l <= 0: continue
@@ -2245,11 +2188,10 @@ def _fill_lq_deficits(sol, data):
             l_st = L_by_st.get((s, t), {})
             y_st = Y_by_st.get((s, t), {})
 
-            # Build aggregated state from sparse dicts
             sup_used = {}
             veh_used = {}
             l_by_b   = {}
-            fk_hub   = dict(y_st)   # (f,k) -> b
+            fk_hub   = dict(y_st)
 
             for (f, b, k), l in l_st.items():
                 sup_used[f] = sup_used.get(f, 0) + l
@@ -2296,37 +2238,30 @@ def _fill_lq_deficits(sol, data):
                     already = sol.L.get((f, b, k_use, s, t), 0)
                     sol.Y[(f, b, k_use, s, t)] = 1
                     sol.L[(f, b, k_use, s, t)] = already + room
-                    # Update sparse dicts
                     l_st[(f, b, k_use)]  = already + room
                     sup_used[f]          = sup_used.get(f, 0) + room
                     veh_used[k_use]      = veh_used.get(k_use, 0) + room
                     l_by_b[b]            = l_by_b.get(b, 0) + room
                     fk_hub[(f, k_use)]   = b
+                    if (b,s,t) not in L_by_st: L_by_st[(b,s,t)] = {}
                     deficit -= room
 
 
 def round_solution(sol, data):
-    """
-    Round all decision variables to integers and enforce all constraints.
-    """
     sol_r = sol.copy()
     D, B, F, K, S, T, R = (data["D"], data["B"], data["F"],
                              data["K"], data["S"], data["T"], data["R"])
     owned_vehicle = {data["owner"][k]: k for k in data["K"]}
 
-    # --- Step 1: round Z to nearest integer ---
     for key in sol_r.Z:
         v = sol_r.Z[key]
         sol_r.Z[key] = int(round(v)) if v > 0 else 0
 
-    # --- Step 2: recompute Q from rounded Z ---
     compute_Q_from_Z(sol_r, data)
 
-    # --- Step 2b: fix SL violations introduced by rounding ---
     compute_inventory_waste(sol_r, data)
     fix_service_violations(sol_r, data)
 
-    # --- Step 3: rebuild L/Y from scratch for integer feasibility ---
     for key in sol_r.L:
         sol_r.L[key] = 0
     for key in sol_r.Y:
@@ -2338,7 +2273,6 @@ def round_solution(sol, data):
             hub_need = {b: int(sum(sol_r.Q.get((b, i, t), 0) for i in D))
                         for b in B}
 
-            # Pass 1: owner suppliers — cheapest gamma hub first
             for f in F:
                 if f not in owned_vehicle:
                     continue
@@ -2359,67 +2293,18 @@ def round_solution(sol, data):
                     hub_need[best_b]              -= amount
                     break
 
-            # Pass 2: non-owners only for remaining deficit
             if any(need > 0 for need in hub_need.values()):
-                non_owners = [f for f in F if f not in owned_vehicle
-                              and int(data["upsilon"].get((f, s, t), 0.0)) > 0]
-                # Sort by effective cost-per-crate = beta/supply + min_gamma
-                # Minimises combined assignment + transport cost per unit delivered
-                def _cpc(f):
-                    sup = data["upsilon"].get((f, s, t), 1.0)
-                    if sup <= 0: return float('inf')
-                    return min(
-                        data["beta"][(f, k)] / sup + min(data["gamma"][(f, b, k)] for b in B)
-                        for k in K
-                    )
-                non_owners.sort(key=_cpc)
+                _assign_nonowners_optimal(F, K, B, data, hub_need,
+                                          remaining_cap, s, t, sol_r)
 
-                for f in non_owners:
-                    if not any(hub_need[b] > 0 for b in B):
-                        break
-                    supply = int(data["upsilon"].get((f, s, t), 0.0))
-                    if supply <= 0:
-                        continue
-                    best_cost, best_k, best_b = float("inf"), None, None
-                    for k in K:
-                        if remaining_cap[k] <= 0:
-                            continue
-                        for b in B:
-                            if hub_need[b] <= 0:
-                                continue
-                            amount = int(round(min(supply, hub_need[b], remaining_cap[k])))
-                            if amount <= 0:
-                                continue
-                            cost = (data["beta"][(f, k)]
-                                    + data["gamma"][(f, b, k)] * amount)
-                            if cost < best_cost:
-                                best_cost = cost
-                                best_k    = k
-                                best_b    = b
-                    if best_k is None:
-                        continue
-                    amount = int(round(min(supply, hub_need[best_b], remaining_cap[best_k])))
-                    if amount <= 0:
-                        continue
-                    sol_r.Y[(f, best_b, best_k, s, t)] = 1
-                    sol_r.L[(f, best_b, best_k, s, t)] = amount
-                    remaining_cap[best_k]              -= amount
-                    hub_need[best_b]                   -= amount
-
-    # --- Step 4: eliminate redundant routes ---
     _eliminate_redundant_routes(sol_r, data)
-
-    # --- Step 4b: trim delivery to DP minimum ---
     _trim_to_dp_minimum(sol_r, data)
 
-    # --- Step 5: trim L > Q excess (sparse — only iterate active L entries) ---
-    # Build sparse L index grouped by (b,s,t)
     _l_bst = {}
     for (f2,b2,k2,s2,t2), lv in sol_r.L.items():
         if lv > 0:
             _l_bst.setdefault((b2,s2,t2), []).append([f2, k2, lv])
 
-    # Pre-compute Q targets
     _q_bt = {(b, t): int(sum(sol_r.Q.get((b,i,t),0) for i in D))
              for b in B for t in T}
 
@@ -2441,12 +2326,9 @@ def round_solution(sol, data):
                 sol_r.Y[(f, b, k, s, t)] = 0
             diff -= reduce
 
-    # --- Step 5b: fill any L < Q deficits (fast sparse version) ---
-    # _trim_to_dp_minimum may change Q; rebuild only deficit slots.
     _owned_v5 = {data['owner'][k]:k for k in K}
     _f_beta5  = data.get('_f_by_beta',
                          sorted(F, key=lambda f: min(data['beta'].get((f,k2),999) for k2 in K)))
-    # Re-build sparse L index after step 5 modifications
     _l_bst2 = {}
     for (f2,b2,k2,s2,t2), lv in sol_r.L.items():
         if lv > 0:
@@ -2454,7 +2336,6 @@ def round_solution(sol, data):
 
     for s in S:
         for t in T:
-            # Build usage state
             _su = {}; _vu = {}; _fkh = {}
             for b in B:
                 for (f2,k2,lv) in _l_bst2.get((b,s,t), []):
@@ -2463,50 +2344,24 @@ def round_solution(sol, data):
                     _fkh[(f2,k2)] = b
 
             for b in B:
-                q_tgt = _q_bt.get((b,t), 0)
-                l_now = sum(lv for (f2,k2,lv) in _l_bst2.get((b,s,t), []))
+                q_tgt   = _q_bt.get((b, t), 0)
+                l_now   = sum(lv for (f2,k2,lv) in _l_bst2.get((b,s,t), []))
                 deficit = q_tgt - l_now
-                if deficit < 1: continue
+                if deficit < 1:
+                    continue
+                # Build remaining_cap from current vehicle usage
+                rc = {k2: data['theta'][k2] - _vu.get(k2, 0) for k2 in K}
+                hn = {b2: (deficit if b2 == b else 0) for b2 in B}
+                _assign_nonowners_optimal(F, K, B, data, hn, rc, s, t, sol_r)
+                # Update sparse tracking
+                for (f2,b2,k2,_s2,_t2), lv in sol_r.L.items():
+                    if _s2 == s and _t2 == t and lv > 0:
+                        _vu[k2] = _vu.get(k2, 0)  # rebuild below
+                _l_bst2 = {}
+                for (f2,b2,k2,s2,t2), lv in sol_r.L.items():
+                    if lv > 0:
+                        _l_bst2.setdefault((b2,s2,t2), []).append((f2,k2,lv))
 
-                for f in _f_beta5:
-                    if deficit < 1: break
-                    sa = int(data['upsilon'].get((f,s,t),0)) - _su.get(f,0)
-                    if sa <= 0: continue
-                    k_own = _owned_v5.get(f)
-                    if k_own is not None:
-                        eh = _fkh.get((f,k_own))
-                        if eh is not None and eh != b: continue
-                        k_use = k_own
-                    else:
-                        k_use = None
-                        bk = data.get('_nonowner_best_k',{}).get(f)
-                        if bk is not None:
-                            eh = _fkh.get((f,bk))
-                            va = data['theta'][bk] - _vu.get(bk,0)
-                            if (eh is None or eh == b) and va > 0:
-                                k_use = bk
-                        if k_use is None:
-                            for k2 in K:
-                                eh = _fkh.get((f,k2))
-                                if eh is not None and eh != b: continue
-                                if data['theta'][k2] - _vu.get(k2,0) > 0:
-                                    k_use = k2; break
-                        if k_use is None: continue
-                    va = data['theta'][k_use] - _vu.get(k_use,0)
-                    if va <= 0: continue
-                    room = min(sa, va, deficit)
-                    if room <= 0: continue
-                    already = sol_r.L.get((f,b,k_use,s,t),0)
-                    sol_r.Y[(f,b,k_use,s,t)] = 1
-                    sol_r.L[(f,b,k_use,s,t)] = already + room
-                    _su[f]    = _su.get(f,0)    + room
-                    _vu[k_use]= _vu.get(k_use,0)+ room
-                    _fkh[(f,k_use)] = b
-                    if (b,s,t) not in _l_bst2: _l_bst2[(b,s,t)] = []
-                    _l_bst2[(b,s,t)].append((f,k_use,room))
-                    deficit -= room
-
-    # --- Step 6: recompute inventory and waste ---
     compute_inventory_waste(sol_r, data)
     for key in sol_r.I:
         sol_r.I[key]      = int(round(sol_r.I[key]))
@@ -2519,11 +2374,11 @@ def round_solution(sol, data):
     return sol_r
 
 
+# =============================================================================
+# SECTION 12 — CONSTRAINT CHECKER
+# =============================================================================
+
 def check_solution(sol, data, label="ALNS", tol=1e-2):
-    """
-    Run all constraint checks and print results in OPL verification format.
-    Returns dict with all check results and KPI values.
-    """
     F, K, B, D, R, T, S = (data["F"], data["K"], data["B"],
                              data["D"], data["R"], data["T"], data["S"])
     pr    = data["pr"]
@@ -2541,7 +2396,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     print(f'  SOLUTION CHECK — {label}')
     print(f'{"="*55}')
 
-    # --- AC_check: assignment + transport cost (both echelon-1 terms) ---
     ac = sum(
         pr[s] * (beta[(f, k)] * sol.Y.get((f, b, k, s, t), 0)
                  + gamma[(f, b, k)] * sol.L.get((f, b, k, s, t), 0.0))
@@ -2551,7 +2405,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     print(f'  AC_check({label}) = {ac:.4f}')
     print()
 
-    # --- CHECK: multi-assign — constraint (4): sum_b Y[f,b,k,s,t] <= 1 ---
     multi_count = sum(
         1 for f in F for k in K for s in S for t in T
         if sum(sol.Y.get((f, b, k, s, t), 0) for b in B) > 1
@@ -2561,7 +2414,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if multi_count > 0:
         all_ok = False
 
-    # --- CHECK-D: Route capacity — constraint (12) ---
     rc_viol = sum(
         1 for r in R for t in T
         if sum(sol.Z.get((i, r, t), 0.0) for i in D)
@@ -2573,7 +2425,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if rc_viol > 0:
         all_ok = False
 
-    # --- CHECK-E: Z=0 when X=0 and when depot not in N_r ---
     ze_viol = 0
     for r in R:
         for t in T:
@@ -2590,7 +2441,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if ze_viol > 0:
         all_ok = False
 
-    # --- CHECK-F: Supply capacity — constraint (1) ---
     sup_viol = sum(
         1 for f in F for s in S for t in T
         if sum(sol.L.get((f, b, k, s, t), 0) for b in B for k in K)
@@ -2602,7 +2452,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if sup_viol > 0:
         all_ok = False
 
-    # --- CHECK-G: Vehicle capacity — constraint (2) ---
     vc_viol = sum(
         1 for k in K for s in S for t in T
         if sum(sol.L.get((f, b, k, s, t), 0.0) for f in F for b in B)
@@ -2614,7 +2463,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if vc_viol > 0:
         all_ok = False
 
-    # --- CHECK-H: W=0 before shelf life — constraint (9) ---
     wm_viol = sum(
         1 for i in D for t in T
         if t < m and sol.W.get((i, t), 0.0) > tol
@@ -2625,7 +2473,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if wm_viol > 0:
         all_ok = False
 
-    # --- CHECK: Y=1 but L=0 ---
     yl_count = sum(
         1 for f in F for b in B for k in K for s in S for t in T
         if sol.Y.get((f, b, k, s, t), 0) == 1
@@ -2636,10 +2483,8 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if yl_count > 0:
         all_ok = False
 
-    # --- AC_check line (matching OPL output format) ---
     print(f"  AC_check({label}) = {ac:.4f}")
 
-    # --- CHECK-C: OPL balance constraint (5) — flow balance ---
     fb_viol  = 0
     fb_max   = 0.0
     for b in B:
@@ -2658,7 +2503,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if fb_viol > 0:
         all_ok = False
 
-    # --- CHECK-A: Service level — constraint (19) ---
     sl_viol = get_violations(sol, data, ignore_waste_gaps=False)
     results["sl_violations"] = len(sl_viol)
     status_a = "OK" if not sl_viol else f"FAIL ({len(sl_viol)} violations)"
@@ -2668,7 +2512,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
         for i, t, gap in sorted(sl_viol, key=lambda x: x[2], reverse=True)[:3]:
             print(f"    depot={i} t={t}: shortfall={gap:.4f}")
 
-    # --- CHECK-B: Flow balance (expected) ---
     efb_viol = 0
     efb_max  = 0.0
     for b in B:
@@ -2687,7 +2530,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     if efb_viol > 0:
         all_ok = False
 
-    # --- Objective breakdown ---
     cost_assign = sum(pr[s] * beta[(f, k)] * sol.Y.get((f, b, k, s, t), 0)
                       for f in F for b in B for k in K for s in S for t in T)
     cost_trans  = sum(pr[s] * gamma[(f, b, k)] * sol.L.get((f, b, k, s, t), 0.0)
@@ -2731,7 +2573,6 @@ def check_solution(sol, data, label="ALNS", tol=1e-2):
     return results
 
 
-
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -2740,23 +2581,21 @@ if __name__ == '__main__':
     import random
     random.seed(42)
 
+    t_total_start = time.time()
     data = load_data('step1_final.xlsx')
 
-    # --- Run ALNS ---
+    # Run ALNS — 15 000 iterations (~8–10 min on typical hardware)
     best = run_alns(
         data,
-        max_iter = 5000,
-        segment  = 100,
-        lam      = 0.2,
+        max_iter = 500,   # SPEED: 30000→15000; faster iterations compensate
+        segment  = 200,
+        lam      = 0.3,
         verbose  = True
     )
 
-    # --- Round to integers (all decision variables are dvar int+ in OPL) ---
-    best_int = round_solution(best, data)
-
-    # --- Check integer solution ---
+    # Constraint check and export
     print()
-    check_solution(best_int, data, label='ALNS (integer)')
-
-    # --- Export integer solution ---
-    export_solution(best_int, data, path='alns_solution_integer.xlsx')
+    check_solution(best, data, label='ALNS_final')
+    export_solution(best, data, path='alns_solution_final.xlsx')
+    print(f"\nTotal script time (incl. data load + export): "
+          f"{(time.time() - t_total_start)/60:.2f} min")

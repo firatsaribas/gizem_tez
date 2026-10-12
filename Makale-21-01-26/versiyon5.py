@@ -376,8 +376,52 @@ def greedy_route_selection_and_loading_int(
     r_cap  = {r.r_id: int_floor(r.capacity) for r in inst.routes}
     r_hub  = {r.r_id: r.hub for r in inst.routes}
 
-    # 1) greedy selection
+    # ------------------------------------------------------------
+    # Helper: build integer Z/Q for a GIVEN selected route set
+    # (same loading logic as current, but isolated for drop tests)
+    # ------------------------------------------------------------
+    def build_ZQ_for_selected(selected_routes: List[str]):
+        Z_local: Dict[Tuple[str, str, int], int] = {}
+        Q_local: Dict[Tuple[str, str, int], int] = {(b, i, t): 0 for b in inst.B for i in inst.D}
+
+        rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+
+        for r_id in selected_routes:
+            cap = r_cap[r_id]
+            deps = [i for i in r_deps[r_id] if rem[i] > 1e-9]
+            deps.sort(key=lambda i: rem[i], reverse=True)
+
+            for i in deps:
+                if cap <= 0:
+                    break
+                x = min(rem[i], cap)
+                x_int = int_floor(x)
+                if x_int > 0:
+                    Z_local[(i, r_id, t)] = Z_local.get((i, r_id, t), 0) + x_int
+                    rem[i] -= x_int
+                    cap -= x_int
+
+        # induce Q from Z
+        for (i, r_id, tt), z in Z_local.items():
+            b = r_hub[r_id]
+            Q_local[(b, i, tt)] += int(z)
+
+        # delivered per depot (sum over hubs)
+        delivered = {i: 0 for i in inst.D}
+        for i in inst.D:
+            delivered[i] = sum(int(Q_local.get((b, i, t), 0)) for b in inst.B)
+
+        return Z_local, Q_local, delivered
+
+    # 1) greedy selection (NEED-based update)
     selected: List[str] = []
+
+    # initialize remaining need
+    need = {i: float(qmin.get(i, 0.0)) for i in inst.D}
+
+    # initial U: depots with positive need
+    U = {i for i in inst.D if need[i] > 1e-9}
+
     while U:
         best_r = None
         best_score = -1.0
@@ -387,12 +431,12 @@ def greedy_route_selection_and_loading_int(
             if not cover:
                 continue
 
-            cover_sum = sum(float(qmin[i]) for i in cover)
+            cover_sum = sum(need[i] for i in cover)
             if cover_sum <= 1e-12:
                 continue
 
-            exp_load = min(float(r_cap[r.r_id]), cover_sum)  # no new param
-            score = exp_load / max(1e-12, r_cost[r.r_id])    # load per euro
+            benefit = min(float(r_cap[r.r_id]), cover_sum)
+            score = benefit / max(1e-12, r_cost[r.r_id])
 
             if score > best_score:
                 best_score = score
@@ -404,8 +448,23 @@ def greedy_route_selection_and_loading_int(
         selected.append(best_r)
         X_t[(best_r, t)] = 1
 
-        # remove covered depots (set-cover style)
-        U = U - r_deps[best_r]
+        # 🔥 IMPORTANT PART: reduce need according to route capacity
+        cap_left = float(r_cap[best_r])
+        deps = list(r_deps[best_r] & U)
+
+        # serve highest remaining need first
+        deps.sort(key=lambda i: need[i], reverse=True)
+
+        for i in deps:
+            if cap_left <= 1e-9:
+                break
+
+            take = min(need[i], cap_left)
+            need[i] -= take
+            cap_left -= take
+
+        # update U based on remaining need
+        U = {i for i in inst.D if need[i] > 1e-9}
 
     # 2) load selected routes (int), prioritizing highest remaining need
     rem = {i: float(qmin.get(i, 0.0)) for i in inst.D}
@@ -430,9 +489,52 @@ def greedy_route_selection_and_loading_int(
         b = r_hub[r_id]
         Q_t[(b, i, tt)] += int(z)
 
+        # ------------------------------------------------------------
+    # SAFE DROP CLEANUP (no new parameters)
+    # Rule: remove a route only if after re-loading, delivered_i
+    #       does NOT decrease for ANY depot i compared to current
+    # ------------------------------------------------------------
+
+    # Build baseline from current selected set (safety reference)
+    Z_base, Q_base, delivered_base = build_ZQ_for_selected(selected)
+
+    # Try dropping routes (cheapest keep not required; full safety)
+    improved = True
+    while improved and len(selected) > 1:
+        improved = False
+
+        # Try to drop one route; if any safe drop found, apply and restart
+        for r_drop in list(selected):
+            test_sel = [r for r in selected if r != r_drop]
+
+            Z_test, Q_test, delivered_test = build_ZQ_for_selected(test_sel)
+
+            # Safety condition: delivered never decreases for any depot
+            ok = True
+            for i in inst.D:
+                if delivered_test[i] < delivered_base[i]:
+                    ok = False
+                    break
+
+            if ok:
+                # accept drop
+                selected = test_sel
+                Z_base, Q_base, delivered_base = Z_test, Q_test, delivered_test
+                improved = True
+                break  # restart while-loop
+
+    # After cleanup, overwrite Z_t and Q_t with the final safe set
+    Z_t = Z_base
+    Q_t = Q_base
+
+    # rebuild X_t from final selected
+    X_t = {}
+    for r_id in selected:
+        X_t[(r_id, t)] = 1
+
     return X_t, Z_t, Q_t
 
-  
+
 
   
 def inbound_assign_greedy_one_scenario_int(
@@ -446,48 +548,89 @@ def inbound_assign_greedy_one_scenario_int(
     Dict[str, int]
 ]:
     """
-    Parametresiz iyileştirme hedefleri:
-      - Y sayısını azalt (assignmentcost ↓): büyük gönderimi ucuza yapan kombinasyonları seç.
-      - Seçim metriği: unit_cost = (beta + gamma*ship) / ship
-      - Aynı hub b için önce zaten kapasitesi kalan "aktif" araçları doldurmaya yatkın seçim.
-      - Supplier yine sadece 1 kez kullanılacak (used_f).
+    Enforced constraints (heuristic-side):
+      (A) sum_b Y[f,b,k,s,t] <= 1  for all f,k,s,t  (already ensured by used_f)
+      (B) Vehicle single-hub per (s,t): each vehicle k can be used for only ONE hub b
+          implemented by vehicle_hub[k] lock.
     """
 
     cap_left = {k: int_floor(inst.theta[k]) for k in inst.K}
     used_f: Set[str] = set()
 
+    # NEW: vehicle->hub lock (per scenario s, period t)
+    vehicle_hub: Dict[str, str] = {k: None for k in inst.K}
+
     Y_s: Dict[Tuple[str, str, str, str, int], int] = {}
     L_s: Dict[Tuple[str, str, str, str, int], int] = {}
     achieved = {b: 0 for b in inst.B}
 
-    # hubs ordered by descending requirement
-    hubs_sorted = sorted(inst.B, key=lambda b: OUT_bt.get(b, 0), reverse=True)
+    
+        # ------------------------------------------------------------
+    # IMPROVEMENT-1: Hub ordering by "difficulty" (no new params)
+    # difficulty proxies:
+    #   - cand_supply[b] : total feasible supply that can reach hub b
+    #   - cand_count[b]  : number of feasible suppliers
+    # Then tie-break by larger requirement OUT_bt[b]
+    # ------------------------------------------------------------
+    cand_supply: Dict[str, int] = {b: 0 for b in inst.B}
+    cand_count: Dict[str, int] = {b: 0 for b in inst.B}
+
+    for b in inst.B:
+        if int(OUT_bt.get(b, 0)) <= 0:
+            continue
+
+        total = 0
+        cnt = 0
+        for f in inst.F:
+            # supply available in this scenario/period
+            v = int_floor(inst.supply.get((f, s, t), 0.0))
+            if v <= 0:
+                continue
+
+            # must be allowed to hub b
+            if (f, b) not in inst.allowed_f_b:
+                continue
+
+            total += v
+            cnt += 1
+
+        cand_supply[b] = total
+        cand_count[b] = cnt
+
+    hubs_sorted = sorted(
+        inst.B,
+        key=lambda b: (
+            cand_supply[b],                 # smaller total supply => harder
+            cand_count[b],                  # fewer suppliers => harder
+            -int(OUT_bt.get(b, 0)),         # larger requirement first
+        )
+    )
+
+    # (Optional) quick debug print
+    # print(f"[DEBUG hub order] s={s} t={t} ->",
+    #       [(b, OUT_bt.get(b,0), cand_supply[b], cand_count[b]) for b in hubs_sorted])
 
     for b in hubs_sorted:
         remaining = int(OUT_bt.get(b, 0))
         if remaining <= 0:
             continue
 
-        # Build candidate suppliers for this hub
+        # candidate suppliers for this hub
         cand_f = []
         for f in inst.F:
             if f in used_f:
                 continue
-
             v = int_floor(inst.supply.get((f, s, t), 0.0))
             if v <= 0:
                 continue
-
             if (f, b) not in inst.allowed_f_b:
                 continue
-
-            # We don't sort purely by gamma anymore; we'll evaluate by unit_cost in (f,k).
             cand_f.append((f, v))
 
-        # Optional: try larger suppliers first to naturally reduce number of Y (no new param)
+        # prefer larger suppliers first (fewer Y)
         cand_f.sort(key=lambda x: x[1], reverse=True)
 
-        # Track "active vehicles" within this (b,s,t): vehicles already used for this hub
+        # active vehicles already used for THIS hub b (still allowed)
         active_k_for_b: Set[str] = set()
 
         for f, v in cand_f:
@@ -505,13 +648,17 @@ def inbound_assign_greedy_one_scenario_int(
             best_unit = float("inf")
             best_total = float("inf")
 
-            # Prefer filling already-used vehicles first (no new param):
-            # - we evaluate active vehicles first, then all others
+            # prefer vehicles already active on this hub first, then others
             k_order = list(active_k_for_b) + [k for k in inst.K if k not in active_k_for_b]
 
             for k in k_order:
                 if cap_left[k] <= 0:
                     continue
+
+                # NEW: vehicle single-hub lock
+                if vehicle_hub[k] is not None and vehicle_hub[k] != b:
+                    continue
+
                 if (f, k) not in inst.beta:
                     continue
                 if (f, b, k) not in inst.gamma:
@@ -524,9 +671,6 @@ def inbound_assign_greedy_one_scenario_int(
                 total_cost = float(inst.beta[(f, k)]) + float(inst.gamma[(f, b, k)]) * float(ship)
                 unit_cost = total_cost / float(ship)
 
-                # Primary: minimize unit_cost
-                # Tie-break 1: maximize ship (fewer Y)
-                # Tie-break 2: minimize total_cost
                 if (unit_cost < best_unit - 1e-12 or
                     (abs(unit_cost - best_unit) <= 1e-12 and ship > best_ship) or
                     (abs(unit_cost - best_unit) <= 1e-12 and ship == best_ship and total_cost < best_total)):
@@ -544,6 +688,10 @@ def inbound_assign_greedy_one_scenario_int(
 
             cap_left[best_k] -= int(best_ship)
             used_f.add(f)
+
+            # NEW: lock vehicle to this hub
+            vehicle_hub[best_k] = b
+
             active_k_for_b.add(best_k)
 
             achieved[b] += int(best_ship)
@@ -1038,7 +1186,46 @@ def check_flow_balance(inst: Instance, sol: FFHSolution) -> pd.DataFrame:
 
     return df 
 
-  
+
+def print_period_kpis(inst: Instance, sol: FFHSolution, t: int) -> None:
+    # --- Route activation / downstream ---
+    selected_routes = [r.r_id for r in inst.routes if int(sol.X.get((r.r_id, t), 0)) == 1]
+    rc_t = sum(r.fixed_cost * float(sol.X.get((r.r_id, t), 0)) for r in inst.routes)
+
+    # total Z and total Q at period t
+    z_t = sum(int(v) for (i, r, tt), v in sol.Z.items() if tt == t and int(v) > 0)
+    q_t = sum(int(sol.Q.get((b, i, t), 0)) for b in inst.B for i in inst.D)
+
+    out_bt = {b: sum(int(sol.Q.get((b, i, t), 0)) for i in inst.D) for b in inst.B}
+
+    # --- Inventory/Waste at t ---
+    w_t = sum(int(sol.W.get((i, t), 0)) for i in inst.D)
+    iend_t = sum(int(sol.Ipos.get((i, t), 0)) for i in inst.D)
+
+    # --- Upstream counts/loads at t ---
+    y_count = sum(1 for (f, b, k, s, tt), y in sol.Y.items() if tt == t and int(y) == 1)
+    l_sum = sum(int(qty) for (f, b, k, s, tt), qty in sol.L.items() if tt == t and int(qty) > 0)
+
+    # scenario-wise IN and flow gaps (quick)
+    gaps = []
+    for s in inst.S:
+        for b in inst.B:
+            in_bst = sum(
+                int(val) for (f, bb, k, ss, tt), val in sol.L.items()
+                if ss == s and tt == t and bb == b
+            )
+            gap = in_bst - out_bt[b]
+            gaps.append(gap)
+
+    print("\n" + "-" * 80)
+    print(f"[KPI] t={t}")
+    print(f"  Selected routes: {len(selected_routes)} | RC_t={rc_t:.2f}")
+    print(f"  Total Z_t={z_t} | Total Q_t={q_t} | OUT per hub={out_bt}")
+    print(f"  Waste W_t={w_t} | End inventory sum(Ipos)_t={iend_t}")
+    print(f"  Upstream: count(Y=1)={y_count} | sum(L)={l_sum}")
+    print(f"  Flow gaps (IN-OUT) at t (min/avg/max) = "
+          f"{min(gaps)}/{sum(gaps)/len(gaps):.2f}/{max(gaps)}")
+    print("-" * 80) 
 
   
 
@@ -1131,7 +1318,7 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
             selected_count = sum(sol.X.get((r.r_id, t), 0) for r in inst.routes) 
 
             print(f"Phase 1 completed (t={t}). Selected routes: {selected_count}") 
-
+            print("  Phase1 OUT(before robust) per hub =", {b: sum(int(sol.Q.get((b,i,t),0)) for i in inst.D) for b in inst.B})
   
 
         # -------- Phase 2 
@@ -1316,6 +1503,7 @@ def solve_ffh(inst: Instance) -> Tuple[FFHSolution, Dict[Tuple[str, int], float]
 
             print(f"Phase 3 completed (t={t}).") 
 
+        print_period_kpis(inst, sol, t)
   
 
     # -------- Cost breakdowns 
